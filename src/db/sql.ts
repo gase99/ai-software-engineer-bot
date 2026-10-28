@@ -62,7 +62,7 @@ export function d1Sql(db: D1Database): Sql {
   };
 }
 
-/** SQLite implementation used by tests and local tooling (Node >= 20). */
+/** SQLite implementation used by tests and local tooling (Node >= 22.5). */
 export async function sqliteSql(path = ':memory:'): Promise<Sql> {
   const { DatabaseSync } = (await import('node:sqlite')) as {
     DatabaseSync: new (location: string) => {
