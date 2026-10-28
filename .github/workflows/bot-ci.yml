@@ -1,0 +1,47 @@
+name: Bot CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit + integration tests
+        run: npm test
+      - name: Secret hygiene (no keys committed)
+        run: |
+          set -e
+          if git grep -nIE '(AIza[0-9A-Za-z_-]{20,}|gsk_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' \
+              -- . ':(exclude).github/workflows/bot-ci.yml' ':(exclude)test/*' ; then
+            echo "::error::possible secret found in the repository"
+            exit 1
+          fi
+          echo "no secrets found"
+      - name: Enforce the execution allow-list
+        run: |
+          # the sandbox workflow must keep the same allow-list as src/github/commands.ts
+          node -e "
+            const fs=require('fs');
+            const wf=fs.readFileSync('.github/workflows/ai-exec.yml','utf8');
+            const src=fs.readFileSync('src/github/commands.ts','utf8');
+            const allowed=[...src.matchAll(/'([a-z][^']*)'/g)].map(m=>m[1]).filter(v=>/ /.test(v)||['pytest','cargo','go','mvn','npm','yarn','pnpm'].some(p=>v.startsWith(p)));
+            const missing=allowed.filter(cmd=>!wf.includes(cmd));
+            if(missing.length){console.error('allow-list drift:',missing);process.exit(1);}
+            console.log('allow-list in sync ('+allowed.length+' commands)');
+          "

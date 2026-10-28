@@ -1,0 +1,28 @@
+{
+  "name": "ai-software-engineer-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-cost Telegram bot that acts as an AI software engineer: understands Persian requests, analyzes GitHub repos, proposes a plan, waits for explicit owner approval, then writes code, runs tests in GitHub Actions and opens a Pull Request.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "demo": "tsx scripts/demo-e2e.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.155.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
