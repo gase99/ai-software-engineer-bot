@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Cloudflare Workers configuration (Mode A - Serverless, free plan friendly)
+# Docs: docs/deploy-cloudflare.md
+# Secrets are NEVER written here. Set them with:
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+# ---------------------------------------------------------------------------
+name = "ai-software-engineer-bot"
+main = "src/index.ts"
+compatibility_date = "2026-01-15"
+compatibility_flags = ["nodejs_compat"]
+
+# Free plan: Workers Cron Triggers are available on the free tier.
+# Every 5 minutes the dispatcher drains the job queue and reports results.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# SQLite-compatible serverless database (free tier: 5M rows read / 100k written per day)
+[[d1_databases]]
+binding = "DB"
+database_name = "ai-eng-bot-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+# Non-secret configuration. Secrets live in `wrangler secret put ...`
+WEBHOOK_PATH = "/telegram/webhook"
+DEFAULT_BRANCH = "main"
+MAX_DIFF_BYTES = "90000"
+MAX_UPLOAD_BYTES = "200000"
+AI_DAILY_TOKEN_LIMIT = "500000"
+AI_MONTHLY_TOKEN_LIMIT = "10000000"
+ACTIONS_MONTHLY_MINUTE_LIMIT = "2000"
+COMMAND_ALLOWLIST = "npm test,npm run test,pytest,pytest -q,npm run lint,npm run build,cargo test,go test ./...,mvn -q test"
+
+# Optional: KV is only needed if you want durable rate-limit counters across
+# isolates without touching D1 on every request. Leave commented out for the
+# simplest (and cheapest) setup.
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "REPLACE_WITH_YOUR_KV_ID"
+
+[observability]
+enabled = true

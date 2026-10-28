@@ -1,0 +1,163 @@
+name: AI Execution Sandbox
+
+# The bot dispatches this workflow (workflow_dispatch) to run whitelisted
+# tests/builds in a clean runner. It is the "sandbox" of Mode A: no Docker on
+# the bot host, no code executed inside the Worker.
+#
+# Hard limits implemented here:
+#   * only commands from ALLOWED_COMMANDS run (no shell metacharacters)
+#   * 15 minute job timeout
+#   * output capped at 100 KB
+#   * minimal GITHUB_TOKEN permissions (contents: read)
+#   * no secrets are exposed to the command step
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Bot job id"
+        required: true
+        type: string
+      request_id:
+        description: "Bot request id"
+        required: false
+        type: string
+      commands:
+        description: "Newline separated, whitelisted commands"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-exec-${{ github.event.inputs.job_id }}
+  cancel-in-progress: false
+
+env:
+  MAX_OUTPUT_BYTES: 102400
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout working branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node (if a Node project)
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python (if a Python project)
+        if: hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (best effort)
+        run: |
+          set +e
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund;
+          elif [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm install --frozen-lockfile;
+          elif [ -f package.json ]; then npm install --no-audit --no-fund; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install . ; fi
+          exit 0
+
+      - name: Validate and run whitelisted commands
+        id: execute
+        run: |
+          set -uo pipefail
+          ALLOWED_COMMANDS=(
+            "npm test" "npm run test" "npm run lint" "npm run build" "npm run typecheck" "npm ci"
+            "pytest" "pytest -q" "python -m pytest"
+            "cargo test" "go test ./..." "mvn -q test" "yarn test" "pnpm test"
+          )
+          MAX_OUTPUT_BYTES="${MAX_OUTPUT_BYTES:-102400}"
+          printf '%s' "${{ github.event.inputs.commands }}" > /tmp/commands.txt
+          : > /tmp/output.txt
+          STATUS="success"
+          REJECTED="[]"
+
+          reject() { REJECTED="$(printf '%s' "$REJECTED" | jq -c --arg c "$1" --arg r "$2" '. + [{command:$c,reason:$r}]' 2>/dev/null || echo '[{"command":"'$1'","reason":"'$2'"}]')"; }
+
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            # no shell metacharacters, ever
+            if printf '%s' "$cmd" | grep -qE '[;&|`$><(){}]'; then
+              reject "$cmd" "shell metacharacter"; continue
+            fi
+            allowed=false
+            for candidate in "${ALLOWED_COMMANDS[@]}"; do
+              if [ "$cmd" = "$candidate" ] || [[ "$cmd" == "$candidate "* ]]; then allowed=true; break; fi
+            done
+            if [ "$allowed" != true ]; then
+              reject "$cmd" "not allowlisted"; continue
+            fi
+            echo "### running: $cmd" >> /tmp/output.txt
+            set +e
+            ( eval "$cmd" ) >> /tmp/output.txt 2>&1
+            code=$?
+            set -e
+            echo "### exit_code: $code" >> /tmp/output.txt
+            if [ "$code" -ne 0 ]; then STATUS="failure"; fi
+          done < /tmp/commands.txt
+
+          # cap output
+          if [ "$(wc -c < /tmp/output.txt)" -gt "$MAX_OUTPUT_BYTES" ]; then
+            head -c "$MAX_OUTPUT_BYTES" /tmp/output.txt > /tmp/output.capped.txt
+            echo -e "\n...[output truncated at ${MAX_OUTPUT_BYTES} bytes]" >> /tmp/output.capped.txt
+            mv /tmp/output.capped.txt /tmp/output.txt
+          fi
+
+          {
+            echo "status=$STATUS"
+            echo "rejected<<EOF"
+            echo "$REJECTED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Emit structured JSON log
+        run: |
+          jq -n \
+            --arg job_id "${{ github.event.inputs.job_id }}" \
+            --arg request_id "${{ github.event.inputs.request_id }}" \
+            --arg status "${{ steps.execute.outputs.status }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --rawfile output /tmp/output.txt \
+            --arg rejected "${{ steps.execute.outputs.rejected }}" \
+            '{ts: (now|todate), job_id:$job_id, request_id:$request_id, level:"info", event:"ai_exec.finished", status:$status, run_url:$run_url, output:($output[0:4000]), rejected:$rejected}' \
+            >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-exec-output-${{ github.event.inputs.job_id }}
+          path: /tmp/output.txt
+          if-no-files-found: ignore
+
+      - name: Report result to the bot
+        if: ${{ vars.BOT_CALLBACK_URL != '' }}
+        env:
+          BOT_CALLBACK_URL: ${{ vars.BOT_CALLBACK_URL }}
+          ACTIONS_CALLBACK_TOKEN: ${{ secrets.ACTIONS_CALLBACK_TOKEN }}
+        run: |
+          STATUS="${{ steps.execute.outputs.status }}"
+          BODY=$(jq -n \
+            --arg job_id "${{ github.event.inputs.job_id }}" \
+            --arg request_id "${{ github.event.inputs.request_id }}" \
+            --arg status "completed" \
+            --arg conclusion "$STATUS" \
+            --rawfile log /tmp/output.txt \
+            '{jobId:$job_id, requestId:$request_id, status:$status, conclusion:$conclusion, log:($log[0:4000])}')
+          curl -sS -X POST "$BOT_CALLBACK_URL" \
+            -H 'content-type: application/json' \
+            -H "x-actions-token: $ACTIONS_CALLBACK_TOKEN" \
+            -d "$BODY" || echo "callback failed (bot may be offline)"
