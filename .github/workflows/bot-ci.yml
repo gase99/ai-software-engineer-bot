@@ -23,7 +23,7 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
       - name: Unit + integration tests
-        run: npm test
+        run: npm test -- --reporter=verbose --reporter=github-actions
       - name: Secret hygiene (no keys committed)
         run: |
           set -e
