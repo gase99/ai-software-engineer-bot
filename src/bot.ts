@@ -1,7 +1,7 @@
 import type { Env } from './env.js';
 import { num } from './env.js';
 import { Store } from './db/store.js';
-import type { Sql } from './db/sql.js';
+import { d1Sql, type Sql } from './db/sql.js';
 import { TelegramClient, TelegramError, type TelegramMessage, type TelegramUpdate } from './telegram/api.js';
 import { confirmKeyboard, mainMenuKeyboard, parseCallbackData, planApprovalKeyboard } from './telegram/keyboard.js';
 import { routeUpdate, type Route } from './telegram/router.js';
@@ -95,7 +95,9 @@ export class Bot {
   }
 
   static async create(env: Env, sql?: Sql, fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis)): Promise<Bot> {
-    const store = new StoreType(sql ?? (env.DB as unknown as Sql));
+    // D1 exposes prepare()/bind()/first()/all()/run(), not the node:sqlite
+    // convenience methods used by Store's backend-neutral Sql interface.
+    const store = new StoreType(sql ?? d1Sql(env.DB));
     await store.init();
     const bot = new Bot(env, store, fetchImpl);
     await bot.providers.sync();
