@@ -24,6 +24,7 @@ function json(body: unknown, status = 200): Response {
  */
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    console.log("FETCH HANDLER STARTED");
     const url = new URL(request.url);
 
     if (request.method === 'GET' && url.pathname === '/health') {
@@ -49,7 +50,13 @@ export default {
     // Telegram webhook.
     if (request.method === 'POST' && url.pathname === (env.WEBHOOK_PATH ?? '/telegram/webhook')) {
       const secret = request.headers.get('x-telegram-bot-api-secret-token') ?? '';
-      if (!env.TELEGRAM_WEBHOOK_SECRET || !(await safeEqual(secret, env.TELEGRAM_WEBHOOK_SECRET))) {
+      const secretMatches = Boolean(env.TELEGRAM_WEBHOOK_SECRET) && (await safeEqual(secret, env.TELEGRAM_WEBHOOK_SECRET));
+      console.log('WEBHOOK SECRET CHECK:', {
+        secretReceived: Boolean(secret),
+        secretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
+        matches: secretMatches,
+      });
+      if (!secretMatches) {
         logger.warn('webhook.bad_secret');
         return json({ ok: false, error: 'unauthorized' }, 401);
       }
