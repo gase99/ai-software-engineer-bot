@@ -45,6 +45,15 @@ export async function hmacSign(secret: string, payload: string): Promise<string>
   return base64UrlEncode(signature);
 }
 
+/**
+ * Compact HMAC for Telegram callback data. 22 base64url characters retain
+ * 132 bits of the SHA-256 HMAC, while keeping callbacks below Telegram's
+ * 64-byte limit. Verification always recomputes the same truncated value.
+ */
+export async function hmacSignShort(secret: string, payload: string): Promise<string> {
+  return (await hmacSign(secret, payload)).slice(0, 22);
+}
+
 /** Constant-time string comparison (avoids leaking approval tokens by timing). */
 export async function safeEqual(a: string, b: string): Promise<boolean> {
   const ha = await sha256Hex(a);

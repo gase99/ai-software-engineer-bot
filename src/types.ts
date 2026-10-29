@@ -15,7 +15,7 @@ export interface Project {
   updated_at: string;
 }
 
-export type RequestStatus = 'draft' | 'analyzing' | 'awaiting_approval' | 'approved' | 'executing' | 'done' | 'failed' | 'cancelled' | 'need_clarification';
+export type RequestStatus = 'draft' | 'queued' | 'analyzing' | 'awaiting_approval' | 'approved' | 'executing' | 'done' | 'failed' | 'cancelled' | 'need_clarification';
 
 export interface RequestRow {
   id: string;

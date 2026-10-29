@@ -98,6 +98,21 @@ describe('AI providers (acceptance tests 2 and 16)', () => {
     expect(report).toContain('ok');
   });
 
+  it('/test_api consumes the same daily cap and makes no HTTP call after exhaustion', async () => {
+    const { bot, store, mock } = await createTestBot({
+      env: { AI_DAILY_REQUEST_LIMIT: '1' },
+      aiReply: { text: 'ok', inputTokens: 8, outputTokens: 2 },
+    });
+
+    const first = await bot.providers.test('gemini');
+    const second = await bot.providers.test('gemini');
+    expect(first[0]?.health.ok).toBe(true);
+    expect(second[0]?.health).toMatchObject({ ok: false, status: 'rate_limited' });
+    expect(mock.callsTo('generativelanguage.googleapis.com')).toHaveLength(1);
+    expect(await store.dailyAiRequestCount()).toBe(1);
+    expect(await store.usageForDay('gemini')).toBe(10);
+  });
+
   it('estimates cost as zero on free tiers and non-zero only for paid providers', () => {
     expect(estimateCostUsd('gemini', 1_000_000, 1_000_000)).toBe(0);
     expect(estimateCostUsd('openai', 1_000_000, 1_000_000)).toBeCloseTo(0.75, 5);

@@ -132,7 +132,7 @@ export class ProviderManager {
     const reasons: Array<{ provider: string; reason: string }> = [];
 
     for (const provider of candidates) {
-      const limits = await checkLimits(this.store, provider);
+      const limits = await checkLimits(this.store, provider, 0, Number(this.env.AI_DAILY_REQUEST_LIMIT ?? 50));
       if (!limits.ok) {
         reasons.push({ provider: provider.name, reason: limits.reason ?? 'limit' });
         continue;
@@ -217,7 +217,12 @@ export class ProviderManager {
         continue;
       }
       let health: ProviderHealth;
-      if (provider.name === 'gemini') {
+      // /test_api is also an outbound AI request. Reserve the same global
+      // daily slot and token budget instead of bypassing the cost guard.
+      const limits = await checkLimits(this.store, provider, 64, Number(this.env.AI_DAILY_REQUEST_LIMIT ?? 50));
+      if (!limits.ok) {
+        health = { ok: false, status: 'rate_limited', latencyMs: 0, error: limits.reason ?? 'سقف AI روزانه پر شده' };
+      } else if (provider.name === 'gemini') {
         health = await testGemini({ apiKey, baseUrl: provider.base_url, model: provider.model, timeoutMs: provider.timeout_ms, fetchImpl: this.fetchImpl });
       } else if (provider.name === 'anthropic') {
         health = await testAnthropic({ apiKey, baseUrl: provider.base_url, model: provider.model, timeoutMs: provider.timeout_ms, fetchImpl: this.fetchImpl });
@@ -230,6 +235,10 @@ export class ProviderManager {
           timeoutMs: provider.timeout_ms,
           fetchImpl: this.fetchImpl,
         });
+      }
+      if (health.ok && health.inputTokens !== undefined && health.outputTokens !== undefined) {
+        const cost = estimateCostUsd(provider.name, health.inputTokens, health.outputTokens);
+        await this.store.recordUsage(provider.name, health.inputTokens, health.outputTokens, cost);
       }
       await this.store.updateProviderHealth(provider.name, health.status, health.error);
       results.push({ provider: provider.name, health });

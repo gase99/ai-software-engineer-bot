@@ -27,6 +27,8 @@ export interface ProviderHealth {
   latencyMs: number;
   error?: string;
   model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export interface ProviderDefinition {

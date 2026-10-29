@@ -49,7 +49,7 @@ export default {
     // Telegram webhook.
     if (request.method === 'POST' && url.pathname === (env.WEBHOOK_PATH ?? '/telegram/webhook')) {
       const secret = request.headers.get('x-telegram-bot-api-secret-token') ?? '';
-      if (env.TELEGRAM_WEBHOOK_SECRET && !(await safeEqual(secret, env.TELEGRAM_WEBHOOK_SECRET))) {
+      if (!env.TELEGRAM_WEBHOOK_SECRET || !(await safeEqual(secret, env.TELEGRAM_WEBHOOK_SECRET))) {
         logger.warn('webhook.bad_secret');
         return json({ ok: false, error: 'unauthorized' }, 401);
       }

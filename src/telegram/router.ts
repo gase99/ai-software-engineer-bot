@@ -26,7 +26,10 @@ export function routeUpdate(update: TelegramUpdate): Route {
     };
   }
 
-  const text = (message.text ?? message.caption ?? '').trim();
+  const rawText = message.text ?? message.caption ?? '';
+  // Trim is a routing concern only. Free-text requests may contain fenced
+  // code or significant whitespace and must reach the request store verbatim.
+  const text = rawText.trim();
   if (!text) return { kind: 'unknown' };
 
   if (text.startsWith('/')) {
@@ -42,5 +45,5 @@ export function routeUpdate(update: TelegramUpdate): Route {
     }
   }
 
-  return { kind: 'text', text };
+  return { kind: 'text', text: rawText };
 }

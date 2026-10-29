@@ -6,7 +6,12 @@ export class PatchError extends Error {
 }
 
 const FORBIDDEN_SEGMENTS = new Set(['.git', 'node_modules', '.github', '..', '.']);
-const SECRET_LOOKING = /(\.env(\.|$)|secret|credential|\.pem$|\.p8$|\.key$|id_rsa)/i;
+const SECRET_LOOKING = /(\.env(\.|$)|secret|credential|\.pem$|\.p8$|\.key$|\.p12$|\.pfx$|\.jks$|\.keystore$|id_(rsa|dsa|ecdsa|ed25519)|(^|\/)\.(npmrc|pypirc|netrc)$|(^|\/)\.docker\/config\.json$)/i;
+
+/** Paths whose contents must never be sent to an AI provider or edited by it. */
+export function isSensitiveRepoPath(path: string): boolean {
+  return SECRET_LOOKING.test(path.trim().replace(/\\/g, '/'));
+}
 
 /**
  * Path guard: a model must never be able to write outside the repository tree
@@ -20,7 +25,7 @@ export function validateRepoPath(path: string): string {
   for (const segment of segments) {
     if (FORBIDDEN_SEGMENTS.has(segment)) throw new PatchError(`مسیر مجاز نیست: ${path}`);
   }
-  if (SECRET_LOOKING.test(normalized)) throw new PatchError(`تغییر فایل‌های حساس مجاز نیست: ${path}`);
+  if (isSensitiveRepoPath(normalized)) throw new PatchError(`تغییر فایل‌های حساس مجاز نیست: ${path}`);
   if (normalized.length > 200) throw new PatchError('مسیر فایل بیش از حد طولانی است');
   return segments.join('/');
 }

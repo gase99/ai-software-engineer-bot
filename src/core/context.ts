@@ -1,6 +1,7 @@
 import type { TreeEntry } from '../github/client.js';
 import { estimateTokens } from '../util/text.js';
 import { wrapUntrusted } from '../security/promptGuard.js';
+import { isSensitiveRepoPath } from './patch.js';
 
 export interface RepoSnapshot {
   owner: string;
@@ -77,6 +78,7 @@ const IGNORED_SUFFIXES = ['.lock', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ic
 export function interestingFiles(tree: TreeEntry[]): TreeEntry[] {
   return tree.filter((entry) => {
     if (entry.type !== 'blob') return false;
+    if (isSensitiveRepoPath(entry.path)) return false;
     if (IGNORED_PREFIXES.some((prefix) => entry.path.startsWith(prefix))) return false;
     if (IGNORED_SUFFIXES.some((suffix) => entry.path.endsWith(suffix))) return false;
     const depth = entry.path.split('/').length;

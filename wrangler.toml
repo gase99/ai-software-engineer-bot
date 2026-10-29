@@ -27,10 +27,11 @@ WEBHOOK_PATH = "/telegram/webhook"
 DEFAULT_BRANCH = "main"
 MAX_DIFF_BYTES = "90000"
 MAX_UPLOAD_BYTES = "200000"
+AI_DAILY_REQUEST_LIMIT = "50"
 AI_DAILY_TOKEN_LIMIT = "500000"
 AI_MONTHLY_TOKEN_LIMIT = "10000000"
-ACTIONS_MONTHLY_MINUTE_LIMIT = "2000"
-COMMAND_ALLOWLIST = "npm test,npm run test,pytest,pytest -q,npm run lint,npm run build,cargo test,go test ./...,mvn -q test"
+ACTIONS_MONTHLY_MINUTE_LIMIT = "100"
+COMMAND_ALLOWLIST = "npm test,npm run test,npm run lint,npm run build,npm run typecheck,npm ci,pytest,pytest -q,python -m pytest,cargo test,go test ./...,mvn -q test,yarn test,pnpm test"
 
 # Optional: KV is only needed if you want durable rate-limit counters across
 # isolates without touching D1 on every request. Leave commented out for the

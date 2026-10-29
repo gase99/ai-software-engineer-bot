@@ -8,22 +8,23 @@ import { routeUpdate, type Route } from './telegram/router.js';
 import { ProviderManager, type ProviderEvent } from './ai/registry.js';
 import { NoProviderAvailableError } from './ai/types.js';
 import { AnalysisEngine } from './core/analyzer.js';
-import { ApprovalService } from './core/approval.js';
+import { ApprovalError, ApprovalService } from './core/approval.js';
 import { ExecutionEngine } from './core/executor.js';
 import { renderPlanReport } from './core/report.js';
 import { takeSnapshot } from './core/snapshot.js';
 import { GithubClient, GithubError } from './github/client.js';
 import { ActionsDispatcher } from './github/actions.js';
 import { resolveGithubToken } from './github/token.js';
-import { checkActionsQuota } from './github/quota.js';
+import { checkActionsQuota, RUN_RESERVATION_MINUTES } from './github/quota.js';
 import { isCommandAllowed, parseAllowlist } from './github/commands.js';
 import { JobRunner } from './jobs/dispatcher.js';
 import { assertOwner, identityFromUpdate, isOwner, ownerIds, UnauthorizedError, type Identity } from './security/auth.js';
 import { checkRateLimit } from './security/rateLimit.js';
-import { isExplicitApproval, isRejection } from './security/promptGuard.js';
+import { isExplicitApproval, isRejection, wrapUntrusted } from './security/promptGuard.js';
 import { escHtml, splitTelegramMessage, toPersianDigits, truncate } from './util/text.js';
-import { hmacSign, randomToken } from './util/crypto.js';
+import { hmacSignShort, randomToken, safeEqual } from './util/crypto.js';
 import { logger } from './util/log.js';
+import { redact } from './security/redact.js';
 import type { JobKind, JobRow, PlanContent, Project, RequestRow } from './types.js';
 import { Store as StoreType } from './db/store.js';
 
@@ -125,7 +126,7 @@ export class Bot {
 
   private async reply(chatId: number, text: string, replyMarkup?: unknown): Promise<TelegramMessage | null> {
     try {
-      const chunks = splitTelegramMessage(text);
+      const chunks = splitTelegramMessage(redact(text));
       let last: TelegramMessage | null = null;
       for (const chunk of chunks) {
         last = await this.telegram.sendMessage(chatId, chunk, { parseMode: 'HTML', replyMarkup });
@@ -142,7 +143,7 @@ export class Bot {
       case 'key_invalid':
         return `⚠️ کلید ارائه‌دهنده <b>${escHtml(event.provider)}</b> معتبر نیست (منقضی یا اشتباه). این ارائه‌دهنده غیرفعال شد.`;
       case 'rate_limited':
-        return `⏳ ارائه‌دهنده <b>${escHtml(event.provider)}</b> به محدودیت نرخ خورده؛ درخواست در صف قرار گرفت.`;
+        return `⏳ ارائه‌دهنده <b>${escHtml(event.provider)}</b> به محدودیت نرخ خورده؛ فقط ارائه‌دهنده رایگان دیگر امتحان می‌شود وگرنه بدون هزینه متوقف می‌شوم.`;
       case 'limit_warning':
         return `📊 <b>${escHtml(event.provider)}</b> نزدیک سقف رایگان است: ${escHtml(event.message)}`;
       case 'fallback':
@@ -164,9 +165,15 @@ export class Bot {
     try {
       const identity = assertOwner(this.env, update);
       const route = routeUpdate(update);
-      const limit = await checkRateLimit(this.store.sql, `chat:${identity.telegramUserId}`, 30, 60_000);
+      const chatId = this.chatIdFromRoute(update, identity);
+      // Limit both dimensions: a user cannot evade the cap by changing chats,
+      // and a group chat cannot be used to multiply one user's allowance.
+      const userLimit = await checkRateLimit(this.store.sql, `user:${identity.telegramUserId}`, 30, 60_000);
+      const chatLimit = chatId
+        ? await checkRateLimit(this.store.sql, `chat:${chatId}`, 30, 60_000)
+        : userLimit;
+      const limit = !userLimit.allowed ? userLimit : chatLimit;
       if (!limit.allowed) {
-        const chatId = this.chatIdFromRoute(update, identity);
         if (chatId) await this.reply(chatId, `⏳ تعداد پیام‌ها زیاد شد؛ ${toPersianDigits(limit.retryAfterSeconds)} ثانیه دیگر دوباره تلاش کن.`);
         return;
       }
@@ -422,7 +429,10 @@ export class Bot {
           );
         }
         const minutes = await this.store.actionsMinutesThisMonth();
-        const limit = num(this.env, 'ACTIONS_MONTHLY_MINUTE_LIMIT', 2000);
+        const aiRequests = await this.store.dailyAiRequestCount();
+        const aiRequestLimit = num(this.env, 'AI_DAILY_REQUEST_LIMIT', 50);
+        const limit = num(this.env, 'ACTIONS_MONTHLY_MINUTE_LIMIT', 100);
+        lines.unshift(`• درخواست AI امروز (همه ارائه‌دهنده‌ها): ${toPersianDigits(aiRequests)} / ${toPersianDigits(aiRequestLimit)}`);
         lines.push(`• دقیقه Actions این ماه: ${toPersianDigits(minutes.toLocaleString('en-US'))} / ${toPersianDigits(limit.toLocaleString('en-US'))}`);
         await this.reply(chatId, `📈 <b>مصرف</b>\n\n${lines.join('\n') || 'هنوز مصرفی ثبت نشده.'}`);
         return;
@@ -469,7 +479,7 @@ export class Bot {
         const project = await this.activeProject();
         if (project) {
           const request = await this.store.latestRequestForProject(project.id);
-          if (request && ['draft', 'analyzing', 'awaiting_approval'].includes(request.status)) {
+          if (request && ['draft', 'queued', 'analyzing', 'awaiting_approval'].includes(request.status)) {
             await this.store.setRequestStatus(request.id, 'cancelled');
             await this.reply(chatId, `🚫 درخواست <code>${escHtml(request.id)}</code> لغو شد.`);
             return;
@@ -482,7 +492,8 @@ export class Bot {
         const rows = [
           `شاخه پیش‌فرض: ${this.env.DEFAULT_BRANCH ?? 'main'}`,
           `سقف روزانه توکن (پیش‌فرض): ${num(this.env, 'AI_DAILY_TOKEN_LIMIT', 500000).toLocaleString('en-US')}`,
-          `سقف دقیقه Actions: ${num(this.env, 'ACTIONS_MONTHLY_MINUTE_LIMIT', 2000).toLocaleString('en-US')}`,
+          `سقف درخواست AI روزانه: ${num(this.env, 'AI_DAILY_REQUEST_LIMIT', 50).toLocaleString('en-US')}`,
+          `سقف دقیقه Actions: ${num(this.env, 'ACTIONS_MONTHLY_MINUTE_LIMIT', 100).toLocaleString('en-US')}`,
           `حجم مجاز فایل ارسالی: ${num(this.env, 'MAX_UPLOAD_BYTES', 200000).toLocaleString('en-US')} بایت`,
           `دستورهای مجاز: ${parseAllowlist(this.env.COMMAND_ALLOWLIST).join(' | ')}`,
         ];
@@ -537,11 +548,16 @@ export class Bot {
       return;
     }
 
-    const token = await this.signAction('newreq', text.slice(0, 64));
+    const nonce = randomToken(12);
+    const token = await this.signAction('newreq', nonce);
+    await this.store.setSetting(
+      `pending:newreq:${identity.telegramUserId}`,
+      JSON.stringify({ text, nonce, expiresAt: Date.now() + 10 * 60_000 }),
+    );
     await this.reply(
       chatId,
       `می‌خواهی این را به‌عنوان درخواست جدید ثبت کنم؟\n\n«${escHtml(truncate(text, 300))}»`,
-      confirmKeyboard('newreq', text.slice(0, 64).replace(/\|/g, ' '), token),
+      confirmKeyboard('newreq', nonce, token),
     );
   }
 
@@ -558,7 +574,7 @@ export class Bot {
     }
     await this.store.setSetting(`upload:${identity.telegramUserId}`, JSON.stringify({ fileName, fileSize, at: new Date().toISOString() }));
     await this.store.audit(String(identity.telegramUserId), 'document.accepted', fileName);
-    await this.reply(chatId, `📄 فایل <code>${escHtml(fileName)}</code> پذیرفته شد و در درخواست بعدی به‌عنوان زمینه استفاده می‌شود.`);
+    await this.reply(chatId, `📄 فایل <code>${escHtml(fileName)}</code> پذیرفته شد؛ فعلاً فقط نام و حجم آن ثبت می‌شود و محتوای فایل خوانده نمی‌شود.`);
   }
 
   // ------------------------------------------------------------- callbacks
@@ -571,7 +587,18 @@ export class Bot {
     }
 
     if (parsed.scope === 'plan') {
+      const callbackLimit = await checkRateLimit(this.store.sql, `approval:${identity.telegramUserId}`, 10, 60_000);
+      if (!callbackLimit.allowed) {
+        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'تعداد کلیک‌ها زیاد شد؛ کمی بعد تلاش کن', true);
+        return;
+      }
       const planVersion = parsed.planVersion ?? 0;
+      const request = await this.store.getRequest(parsed.requestId);
+      if (!request || request.current_plan_version !== planVersion || request.status !== 'awaiting_approval') {
+        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'این دکمه مربوط به طرح فعلی نیست', true);
+        return;
+      }
+
       if (parsed.action === 'approve') {
         const verification = await this.approvals.approve(parsed.requestId, planVersion, parsed.token, String(identity.telegramUserId));
         if (!verification.ok) {
@@ -587,8 +614,8 @@ export class Bot {
         return;
       }
 
-      // revise / explain / cancel only need a *valid, pending* approval token,
-      // never an approval decision.
+      // revise / explain / cancel require a valid pending token but do not
+      // consume it as an approval. All state transitions are rechecked above.
       const verification = await this.approvals.verify(parsed.requestId, planVersion, parsed.token);
       if (!verification.ok) {
         if (queryId) await this.telegram.answerCallbackQuery(queryId, verification.reason ?? 'درخواست منقضی شده', true);
@@ -601,7 +628,11 @@ export class Bot {
       } else if (parsed.action === 'explain') {
         await this.explainPlan(parsed.requestId, planVersion, chatId);
       } else if (parsed.action === 'cancel') {
-        await this.approvals.reject(parsed.requestId, planVersion, parsed.token, String(identity.telegramUserId));
+        const rejected = await this.approvals.reject(parsed.requestId, planVersion, parsed.token, String(identity.telegramUserId));
+        if (!rejected.ok) {
+          if (queryId) await this.telegram.answerCallbackQuery(queryId, rejected.reason ?? 'لغو ممکن نشد', true);
+          return;
+        }
         await this.store.setRequestStatus(parsed.requestId, 'cancelled');
         await this.reply(chatId, '🚫 درخواست لغو شد. هیچ تغییری در مخزن ایجاد نشد.');
         await this.store.audit(String(identity.telegramUserId), 'request.cancelled', parsed.requestId);
@@ -611,12 +642,33 @@ export class Bot {
     }
 
     if (parsed.action === 'confirm' && parsed.scope === 'newreq') {
+      const key = `pending:newreq:${identity.telegramUserId}`;
+      const raw = await this.store.getSetting(key);
+      let pending: { text?: string; nonce?: string; expiresAt?: number } | null = null;
+      try {
+        pending = raw ? (JSON.parse(raw) as { text?: string; nonce?: string; expiresAt?: number }) : null;
+      } catch {
+        pending = null;
+      }
       const expected = await this.signAction('newreq', parsed.requestId);
-      if (expected.split('.')[1] !== parsed.token.split('.')[1]) {
-        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'درخواست منقضی شده', true);
+      if (
+        !pending?.text ||
+        pending.nonce !== parsed.requestId ||
+        !pending.expiresAt ||
+        pending.expiresAt <= Date.now() ||
+        !(await safeEqual(expected, parsed.token))
+      ) {
+        await this.store.deleteSetting(key);
+        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'درخواست منقضی شده؛ دوباره بفرست', true);
         return;
       }
-      await this.startRequest(parsed.requestId, chatId, identity, context);
+      // DELETE ... RETURNING semantics via an atomic conditional consume make
+      // a double click unable to create two requests.
+      if (!(await this.store.consumeSetting(key))) {
+        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'این درخواست قبلاً ثبت شد', true);
+        return;
+      }
+      await this.startRequest(pending.text, chatId, identity, context);
       if (queryId) await this.telegram.answerCallbackQuery(queryId);
       return;
     }
@@ -642,18 +694,11 @@ export class Bot {
       return;
     }
     const request = await this.store.createRequest(project.id, chatId, text);
-    await this.store.setRequestStatus(request.id, 'analyzing');
-    await this.reply(chatId, `🧠 درخواست ثبت شد (<code>${escHtml(request.id)}</code>). در حال تحلیل مخزن …`);
-
-    const job = await this.store.enqueue({ requestId: request.id, kind: 'analyze', payload: { requestId: request.id, chatId } });
-    const work = this.runJob(job.id, 'analyze').catch((error) => {
-      logger.error('analyze.failed', { requestId: request.id, error: (error as Error).message });
-      return this.reply(chatId, `❌ تحلیل انجام نشد: ${escHtml(truncate((error as Error).message, 400))}`);
-    });
-    // Run inline when the invocation has budget left; the cron tick is the
-    // safety net when it does not.
-    if (context.waitUntil) context.waitUntil(work);
-    else await work;
+    await this.store.setRequestStatus(request.id, 'queued');
+    await this.store.enqueue({ requestId: request.id, kind: 'analyze', payload: { requestId: request.id, chatId } });
+    // Never perform GitHub/AI work before acknowledging the webhook. Cron is
+    // the durable execution path and also makes local queue tests deterministic.
+    await this.reply(chatId, `🧠 درخواست ثبت شد (<code>${escHtml(request.id)}</code>) و در صف تحلیل قرار گرفت.`);
   }
 
   private async enqueueExecution(requestId: string, planVersion: number, chatId: number, context: BotContext): Promise<void> {
@@ -679,10 +724,7 @@ export class Bot {
     ]);
     await this.store.setRequestStatus(requestId, 'analyzing');
     await this.reply(chatId, '✏️ در حال ساخت نسخه جدید طرح …');
-    const job = await this.store.enqueue({ requestId, kind: 'analyze', payload: { requestId, chatId } });
-    const work = this.runJob(job.id, 'analyze');
-    if (context.waitUntil) context.waitUntil(work);
-    else await work;
+    await this.store.enqueue({ requestId, kind: 'analyze', payload: { requestId, chatId } });
     await this.store.audit(String(identity.telegramUserId), 'plan.revise', requestId);
   }
 
@@ -702,7 +744,7 @@ export class Bot {
           },
           {
             role: 'user',
-            content: `این طرح را ساده توضیح بده:\n${JSON.stringify(plan).slice(0, 4000)}`,
+            content: `این طرح را ساده توضیح بده:\n${wrapUntrusted('plan', JSON.stringify(plan), 4000)}`,
           },
         ],
         temperature: 0.3,
@@ -744,6 +786,11 @@ export class Bot {
 
     if (kind === 'analyze') {
       if (!payload.requestId) throw new Error('analyze job without requestId');
+      const current = await this.store.getRequest(payload.requestId);
+      if (!current || !['queued', 'analyzing'].includes(current.status)) {
+        await this.store.completeJob(jobId, { skipped: 'stale_or_cancelled_request' });
+        return;
+      }
       await this.runAnalyze(payload.requestId, chatId);
       await this.store.completeJob(jobId, { requestId: payload.requestId });
       return;
@@ -751,17 +798,38 @@ export class Bot {
 
     if (kind === 'execute') {
       if (!payload.requestId) throw new Error('execute job without requestId');
-      await this.store.setRequestStatus(payload.requestId, 'executing');
-      const planRow = await this.store.latestPlan(payload.requestId);
       const request = await this.store.getRequest(payload.requestId);
+      const planVersion = payload.planVersion;
+      const planRow = planVersion ? await this.store.getPlan(payload.requestId, planVersion) : null;
       const project = request ? await this.store.getProject(request.project_id) : null;
       if (!request || !project || !planRow) throw new Error('داده‌های درخواست ناقص است');
+      if (request.status !== 'approved' || request.current_plan_version !== planRow.version) {
+        await this.store.completeJob(jobId, { skipped: 'stale_or_unapproved_plan' });
+        return;
+      }
+      await this.store.setRequestStatus(payload.requestId, 'executing');
 
       const executor = await this.executor();
-      const result = await executor.execute(
-        { request, project, plan: StoreType.parsePlan(planRow), planVersion: planRow.version },
-        'owner',
-      );
+      let result: Awaited<ReturnType<ExecutionEngine['execute']>>;
+      try {
+        result = await executor.execute(
+          { request, project, plan: StoreType.parsePlan(planRow), planVersion: planRow.version },
+          'owner',
+        );
+      } catch (error) {
+        if (!(error instanceof ApprovalError)) throw error;
+        // The plan may have changed or expired between the click and this job.
+        // Stop before writes and issue a fresh approval instead of retrying an
+        // execution that can never pass the final approval gate.
+        const current = await this.store.getRequest(payload.requestId);
+        const latest = await this.store.latestPlan(payload.requestId);
+        if (current && latest && !['cancelled', 'done'].includes(current.status)) {
+          await this.store.setRequestStatus(payload.requestId, 'awaiting_approval', { currentPlanVersion: latest.version });
+          if (chatId) await this.sendPlanMessage({ ...current, status: 'awaiting_approval', current_plan_version: latest.version }, chatId);
+        }
+        await this.store.completeJob(jobId, { skipped: 'approval_recheck_failed' });
+        return;
+      }
       await this.store.setRequestStatus(payload.requestId, 'done');
       if (chatId) await this.reportExecution(result, request, chatId);
       await this.store.completeJob(jobId, { branch: result.branch, pr: result.pullRequest?.number ?? null });
@@ -775,7 +843,21 @@ export class Bot {
       const branch = String((job.payload_json && JSON.parse(job.payload_json).branch) || project.default_branch);
       const commands = (payload.commands ?? []).map((command) => isCommandAllowed(command, parseAllowlist(this.env.COMMAND_ALLOWLIST))).filter((c) => c.allowed).map((c) => c.command);
       if (!commands.length) throw new Error('هیچ دستور مجازی برای اجرا وجود ندارد');
-      const dispatch = await dispatcher.dispatch({ owner: project.repo_owner, repo: project.repo_name, branch, jobId, requestId: payload.requestId ?? '', commands });
+      const quota = await checkActionsQuota(
+        this.store,
+        num(this.env, 'ACTIONS_MONTHLY_MINUTE_LIMIT', 100),
+        RUN_RESERVATION_MINUTES,
+      );
+      if (quota.level === 'blocked') throw new Error(`سقف ${quota.limitMinutes} دقیقه Actions این ماه پر شده`);
+      const dispatch = await dispatcher.dispatch({
+        owner: project.repo_owner,
+        repo: project.repo_name,
+        branch,
+        jobId,
+        requestId: payload.requestId ?? '',
+        commands,
+        reservedMinutes: RUN_RESERVATION_MINUTES,
+      });
       if (!dispatch.runId) throw new Error(dispatch.note ?? 'اجرای تست در Actions ممکن نشد');
       const outcome = await dispatcher.outcome(project.repo_owner, project.repo_name, dispatch.runId);
       if (chatId) {
@@ -823,7 +905,7 @@ export class Bot {
               chatId,
               `⏸ هیچ ارائه‌دهنده رایگانی در دسترس نیست (${escHtml(
                 error.reasons.map((reason) => `${reason.provider}: ${reason.reason}`).join(' | '),
-              )}). درخواست در صف ماند و بعداً ادامه می‌دهیم.`,
+              )}). تحلیل متوقف و درخواست failed شد؛ پس از رفع محدودیت یا فردا با /new دوباره تلاش کن.`,
             );
           }
           return;
@@ -850,10 +932,10 @@ export class Bot {
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
       });
-      await this.store.setRequestStatus(requestId, 'awaiting_approval');
+      await this.store.setRequestStatus(requestId, 'awaiting_approval', { currentPlanVersion: version });
       await this.store.audit('owner', 'plan.created', requestId, { provider: result.provider, model: result.model, version });
 
-      if (chatId) await this.sendPlanMessage(request, chatId);
+      if (chatId) await this.sendPlanMessage({ ...request, status: 'awaiting_approval', current_plan_version: version }, chatId);
     } catch (error) {
       await this.store.setRequestStatus(requestId, 'failed');
       if (chatId) await this.reply(chatId, `❌ تحلیل مخزن انجام نشد: ${escHtml(truncate((error as Error).message, 400))}`);
@@ -899,9 +981,8 @@ export class Bot {
     await this.store.setSetting(`convo:${userId}`, JSON.stringify(state));
   }
 
-  private async signAction(scope: string, subject: string): Promise<string> {
-    const nonce = randomToken(12);
-    return `${nonce}.${await hmacSign(this.env.APPROVAL_SECRET, `${scope}.${subject}.${nonce}`)}`;
+  private async signAction(scope: string, nonce: string): Promise<string> {
+    return `${nonce}.${await hmacSignShort(this.env.APPROVAL_SECRET, `${scope}.${nonce}`)}`;
   }
 
   async tick(): Promise<{ processed: number; failed: number }> {

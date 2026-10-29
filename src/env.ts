@@ -39,6 +39,7 @@ export interface Env {
   DEFAULT_BRANCH?: string;
   MAX_DIFF_BYTES?: string;
   MAX_UPLOAD_BYTES?: string;
+  AI_DAILY_REQUEST_LIMIT?: string;
   AI_DAILY_TOKEN_LIMIT?: string;
   AI_MONTHLY_TOKEN_LIMIT?: string;
   ACTIONS_MONTHLY_MINUTE_LIMIT?: string;
