@@ -131,6 +131,7 @@ export class Bot {
       const chunks = splitTelegramMessage(redact(text));
       let last: TelegramMessage | null = null;
       for (const chunk of chunks) {
+        console.log("TRYING TO SEND REPLY...");
         last = await this.telegram.sendMessage(chatId, chunk, { parseMode: 'HTML', replyMarkup });
       }
       return last;
@@ -165,6 +166,7 @@ export class Bot {
   // ------------------------------------------------------------ update entry
   async handleUpdate(update: TelegramUpdate, context: BotContext = {}): Promise<void> {
     try {
+      console.log("AUTH CHECK:", { ownerId: this.env.OWNER_TELEGRAM_ID, senderId: update.message?.from?.id });
       const identity = assertOwner(this.env, update);
       const route = routeUpdate(update);
       const chatId = this.chatIdFromRoute(update, identity);
@@ -241,6 +243,7 @@ export class Bot {
     switch (command) {
       case 'start': {
         await this.store.setSetting(`chat:${identity.telegramUserId}`, String(chatId));
+        console.log("TRYING TO SEND REPLY...");
         await this.telegram.sendMessage(
           chatId,
           'سلام 👋\nمن مهندس نرم‌افزار هوش مصنوعی شما هستم.\nدرخواستت را به فارسی ساده بنویس؛ من مخزن را تحلیل می‌کنم، طرح می‌دهم و بعد از تأیید خودت کد می‌نویسم، تست اجرا می‌کنم و Pull Request می‌سازم.\n\nهیچ تغییری بدون تأیید شما انجام نمی‌شود.',
