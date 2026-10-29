@@ -16,7 +16,7 @@
 | بررسی | نتیجه در تاریخ سند |
 |---|---|
 | `npm run typecheck` | موفق |
-| `npm test` | **۹۷/۹۷ تست در ۱۴ فایل موفق** |
+| `npm test` | **۹۸/۹۸ تست در ۱۴ فایل موفق** |
 | `npm audit --audit-level=high` | **۰ آسیب‌پذیری شناخته‌شده** |
 | اجرای واقعی Telegram/Gemini/Cloudflare/`ai-exec.yml` | انجام نشد؛ نیازمند مالک |
 | Deploy یا Merge | انجام نشد |
@@ -25,7 +25,7 @@
 
 | شدت | یافته و ریسک | اصلاح انجام‌شده | مدرک/تست |
 |---|---|---|---|
-| بحرانی | خالی بودن `TELEGRAM_WEBHOOK_SECRET` می‌توانست Webhook را بدون بررسی Secret بپذیرد و جعل شناسهٔ مالک را ممکن کند. | وجود Secret و تطابق constant-time اکنون اجباری است؛ وگرنه ۴۰۱. | `src/index.ts`; تست‌های Webhook/Auth و چک‌لیست دستی |
+| بحرانی | خالی بودن `TELEGRAM_WEBHOOK_SECRET` می‌توانست Webhook را بدون بررسی Secret بپذیرد و جعل شناسهٔ مالک را ممکن کند. | وجود Secret و تطابق constant-time اکنون اجباری است؛ وگرنه ۴۰۱. | `src/index.ts`; `test/auth.test.ts` («missing or wrong») |
 | بحرانی | Replay، رقابت دو کلیک، یا تغییر طرح می‌توانست Approval قدیمی را قابل استفاده نگه دارد. | HMAC کوتاه + هش توکن + `request_id` + `plan_version` + انقضا + وضعیت فعلی + مصرف اتمیک + بررسی دوباره در Executor. | `test/approval.test.ts`; `test/hardening.test.ts` («only one concurrent…», «current plan version…») |
 | بحرانی | لغو و تأیید قدیمی ممکن بود با هم رقابت کنند. | لغو Approval را `rejected` می‌کند، درخواست `cancelled` می‌شود و Callback بعدی نمی‌تواند آن را احیا کند. | `test/executor.test.ts` («consumes approval on cancel…») |
 | بحرانی | مسیر `create` می‌توانست خارج از فایل‌های تأییدشده نوشته شود. | همهٔ مسیرها و Scope قبل از نخستین نوشتن GitHub اعتبارسنجی می‌شوند؛ ساخت فایل هم استثنا نیست. | `test/hardening.test.ts` («out-of-scope create…») |

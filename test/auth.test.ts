@@ -1,7 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import { createTestBot, OWNER_ID, update } from './helpers.js';
+import worker from '../src/index.js';
 
 describe('owner authorization (acceptance test 1)', () => {
+  it('rejects webhook updates when the secret is missing or wrong', async () => {
+    const context = { waitUntil: () => undefined };
+    const request = () => new Request('https://worker.example/telegram/webhook', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': 'wrong-secret' },
+      body: '{}',
+    });
+
+    const missing = await worker.fetch(request(), { TELEGRAM_WEBHOOK_SECRET: '' } as never, context);
+    const wrong = await worker.fetch(request(), { TELEGRAM_WEBHOOK_SECRET: 'configured-secret' } as never, context);
+    expect(missing.status).toBe(401);
+    expect(wrong.status).toBe(401);
+  });
+
   it('rejects a user who is not the owner and audits the attempt', async () => {
     const { bot, store, telegram } = await createTestBot();
 

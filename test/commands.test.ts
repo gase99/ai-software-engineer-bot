@@ -107,6 +107,7 @@ describe('Telegram interface in Persian (phase 1-3 deliverables)', () => {
       message: { message_id: 10, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, document: { file_id: 'f1', file_name: 'notes.md', file_size: 500 } },
     });
     expect(telegram.messages.at(-1)!.text).toContain('پذیرفته شد');
+    expect(telegram.messages.at(-1)!.text).toContain('محتوای فایل خوانده نمی‌شود');
 
     await bot.handleUpdate({
       update_id: 11,
