@@ -56,7 +56,14 @@ export async function testAnthropic(input: { apiKey: string; baseUrl: string; mo
       ...input,
       request: { messages: [{ role: 'user', content: 'Say OK' }], maxOutputTokens: 16 },
     });
-    return { ok: true, status: 'ok', latencyMs: Date.now() - started, model: result.model };
+    return {
+      ok: true,
+      status: 'ok',
+      latencyMs: Date.now() - started,
+      model: result.model,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+    };
   } catch (error) {
     const err = error as AiProviderError;
     return { ok: false, status: String(err.status ?? 'error'), latencyMs: Date.now() - started, error: err.message };

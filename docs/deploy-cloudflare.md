@@ -58,8 +58,9 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 
 ```toml
 COMMAND_ALLOWLIST = "npm test,npm run test,pytest,npm run lint"
+AI_DAILY_REQUEST_LIMIT = "50"
 AI_DAILY_TOKEN_LIMIT = "500000"
-ACTIONS_MONTHLY_MINUTE_LIMIT = "2000"
+ACTIONS_MONTHLY_MINUTE_LIMIT = "100"
 MAX_UPLOAD_BYTES = "200000"
 ```
 

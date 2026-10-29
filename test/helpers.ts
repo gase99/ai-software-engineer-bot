@@ -97,6 +97,7 @@ export interface GithubState {
 
 export function mockGithub(mock: FetchMock, state: GithubState): GithubState {
   const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
+  let dispatchedJobId = '';
 
   mock.on(/api\.github\.com\/repos\/[^/]+\/[^/]+\/git\/trees\//, () =>
     jsonResponse({ tree: state.tree, truncated: false }),
@@ -132,7 +133,11 @@ export function mockGithub(mock: FetchMock, state: GithubState): GithubState {
   mock.on(/\/repos\/[^/]+\/[^/]+\/commits/, () =>
     jsonResponse([{ sha: 'abc1234', commit: { message: 'initial commit', author: { name: 'owner' } } }]),
   );
-  mock.on(/\/repos\/[^/]+\/[^/]+\/actions\/workflows\/.*\/dispatches/, () => new Response(null, { status: 204 }));
+  mock.on(/\/repos\/[^/]+\/[^/]+\/actions\/workflows\/.*\/dispatches/, (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { inputs?: { job_id?: string } };
+    dispatchedJobId = body.inputs?.job_id ?? '';
+    return new Response(null, { status: 204 });
+  });
   mock.on(/\/repos\/[^/]+\/[^/]+\/actions\/runs\/(\d+)\/jobs/, () =>
     jsonResponse({ jobs: [{ name: 'run', conclusion: 'success', steps: [{ name: 'Run tests', conclusion: 'success', number: 1 }] }] }),
   );
@@ -158,6 +163,8 @@ export function mockGithub(mock: FetchMock, state: GithubState): GithubState {
           run_started_at: '2026-01-01T00:00:00Z',
           updated_at: '2026-01-01T00:03:00Z',
           head_branch: url.searchParams.get('branch') ?? 'main',
+          display_title: `ai-exec:${dispatchedJobId}`,
+          event: 'workflow_dispatch',
         },
       ],
     }),
@@ -223,7 +230,8 @@ export async function createTestBot(options: {
     GITHUB_TOKEN: 'ghp_fakeGithubTokenForTests000000000',
     GEMINI_API_KEY: 'AIzaFakeGeminiKeyForTests000000000',
     AI_DAILY_TOKEN_LIMIT: '500000',
-    ACTIONS_MONTHLY_MINUTE_LIMIT: '2000',
+    AI_DAILY_REQUEST_LIMIT: '50',
+    ACTIONS_MONTHLY_MINUTE_LIMIT: '100',
     COMMAND_ALLOWLIST: 'npm test,pytest,npm run lint',
     ...options.env,
   } as Env;

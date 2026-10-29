@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createTestBot, codeJson, planJson, OWNER_ID, update } from './helpers.js';
+import { parseCallbackData } from '../src/telegram/keyboard.js';
 
 /** The analysis prompt and the coding prompt are answered differently. */
 function smartReply(body: unknown): { text: string; inputTokens: number; outputTokens: number } {
@@ -8,11 +9,15 @@ function smartReply(body: unknown): { text: string; inputTokens: number; outputT
   return { text: planJson(), inputTokens: 500, outputTokens: 300 };
 }
 
-async function approveData(markup: unknown): Promise<string> {
+async function actionData(markup: unknown, action: 'approve' | 'cancel'): Promise<string> {
   const keyboard = markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
-  const approve = keyboard.inline_keyboard.flat().find((button) => button.callback_data.includes('|approve|'));
-  if (!approve) throw new Error('no approve button was rendered');
-  return approve.callback_data;
+  const button = keyboard.inline_keyboard.flat().find((candidate) => parseCallbackData(candidate.callback_data)?.action === action);
+  if (!button) throw new Error(`no ${action} button was rendered`);
+  return button.callback_data;
+}
+
+async function approveData(markup: unknown): Promise<string> {
+  return actionData(markup, 'approve');
 }
 
 async function runFullFlow() {
@@ -21,6 +26,7 @@ async function runFullFlow() {
 
   await bot.handleUpdate(update({ message: { message_id: 1, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/project owner/repo' } }));
   await bot.handleUpdate(update({ update_id: 2, message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/new یک تابع تفریق اضافه کن و تستش را بنویس' } }));
+  await bot.tick();
 
   const planMessage = telegram.messages.filter((message) => message.replyMarkup).pop()!;
   const data = await approveData(planMessage.replyMarkup);
@@ -104,8 +110,8 @@ describe('end-to-end flow (acceptance tests 7, 8, 9, 10, 11)', () => {
 
   it('refuses a forged approval callback: no branch, no commit, no PR', async () => {
     const { bot, github, mock, data } = await runFullFlow();
-    const [requestId, version, action, token] = data.replace('plan|', '').split('|') as [string, string, string, string];
-    const forged = `plan|${requestId}|${version}|${action}|${token.slice(0, -3)}xyz`;
+    const parsed = parseCallbackData(data)!;
+    const forged = `p|a|${parsed.requestId}|${parsed.planVersion}|${parsed.token.slice(0, -3)}xyz`;
 
     await bot.handleUpdate({
       update_id: 4,
@@ -123,8 +129,8 @@ describe('end-to-end flow (acceptance tests 7, 8, 9, 10, 11)', () => {
   });
 
   it('cancels cleanly when the owner presses لغو', async () => {
-    const { bot, store, telegram, github, data } = await runFullFlow();
-    const cancel = data.replace('|approve|', '|cancel|');
+    const { bot, store, telegram, github, planMessage } = await runFullFlow();
+    const cancel = await actionData(planMessage.replyMarkup, 'cancel');
 
     await bot.handleUpdate({
       update_id: 5,
@@ -136,6 +142,35 @@ describe('end-to-end flow (acceptance tests 7, 8, 9, 10, 11)', () => {
     const project = await store.getProject((await store.getActiveProjectId())!);
     const request = (await store.latestRequestForProject(project!.id))!;
     expect(request.status).toBe('cancelled');
+  });
+
+  it('consumes approval on cancel and never executes a later stale approval', async () => {
+    const { bot, store, github, mock, data, planMessage } = await runFullFlow();
+    const cancel = await actionData(planMessage.replyMarkup, 'cancel');
+    const callback = (id: string, callbackData: string, updateId: number) => ({
+      update_id: updateId,
+      callback_query: {
+        id,
+        from: { id: OWNER_ID },
+        data: callbackData,
+        message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' } },
+      },
+    });
+
+    await bot.handleUpdate(callback('cancel-real', cancel, 7));
+    const project = await store.getProject((await store.getActiveProjectId())!);
+    const cancelled = (await store.latestRequestForProject(project!.id))!;
+    expect(cancelled.status).toBe('cancelled');
+    expect((await store.getApproval(cancelled.id, 1))?.status).toBe('rejected');
+
+    // Even the previously valid approve button cannot revive a cancelled plan.
+    await bot.handleUpdate(callback('approve-stale', data, 8));
+    await bot.tick();
+    expect((await store.getRequest(cancelled.id))?.status).toBe('cancelled');
+    expect(github.commits).toHaveLength(0);
+    expect(mock.callsTo('/git/refs')).toHaveLength(0);
+    expect(mock.callsTo('/pulls')).toHaveLength(0);
+    expect((await store.listJobs()).filter((job) => job.kind === 'execute')).toHaveLength(0);
   });
 
   it('reports honestly when the repo has no execution workflow', async () => {

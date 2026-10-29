@@ -1,14 +1,14 @@
 import type { GithubClient } from '../github/client.js';
 import type { ActionsDispatcher, RunOutcome } from '../github/actions.js';
 import type { AnalysisEngine } from './analyzer.js';
-import type { ApprovalService } from './approval.js';
+import { ApprovalError, type ApprovalService } from './approval.js';
 import type { Store } from '../db/store.js';
 import type { FileChange, PlanContent, Project, RequestRow } from '../types.js';
 import { Store as StoreClass } from '../db/store.js';
 import { detectStack } from './context.js';
 import { validateRepoPath } from './patch.js';
 import { isCommandAllowed, parseAllowlist } from '../github/commands.js';
-import { checkActionsQuota, estimateRunMinutes } from '../github/quota.js';
+import { checkActionsQuota, RUN_RESERVATION_MINUTES } from '../github/quota.js';
 import { redact } from '../security/redact.js';
 import { logger } from '../util/log.js';
 
@@ -52,10 +52,8 @@ export class ExecutionEngine {
   ) {}
 
   private async requireApproval(context: ExecutionContext, actor: string): Promise<void> {
-    const approval = await this.store.getApproval(context.request.id, context.planVersion);
-    if (!approval || approval.status !== 'approved') {
-      throw new Error('این درخواست تأیید معتبر ندارد؛ بدون تأیید هیچ تغییری اعمال نمی‌شود');
-    }
+    const verification = await this.approvals.verifyApproved(context.request.id, context.planVersion);
+    if (!verification.ok) throw new ApprovalError(verification.reason ?? 'تأیید معتبر برای اجرا وجود ندارد');
     await this.store.audit(actor, 'execution.start', context.request.id, {
       planVersion: context.planVersion,
       files: context.plan.files,
@@ -77,6 +75,14 @@ export class ExecutionEngine {
     const owner = project.repo_owner;
     const repo = project.repo_name;
     const baseBranch = project.default_branch;
+
+    // Validate the full scope before the first remote write. Creation is not
+    // allowed to bypass the exact file list that the owner approved.
+    const approvedPaths = new Set(plan.files.map((path) => validateRepoPath(path)));
+    for (const change of plan.fileChanges ?? []) {
+      const path = validateRepoPath(change.path);
+      if (!approvedPaths.has(path)) throw new Error(`فایل ${path} خارج از محدوده تأییدشده است`);
+    }
 
     // 1. Git state check -----------------------------------------------------
     if (!(await this.github.branchExists(owner, repo, baseBranch))) {
@@ -168,7 +174,7 @@ export class ExecutionEngine {
       owner,
       repo,
       title: `feat(ai): ${plan.outcome.slice(0, 70)}`,
-      body: prBody,
+      body: redact(prBody),
       head: branch,
       base: baseBranch,
     });
@@ -183,20 +189,29 @@ export class ExecutionEngine {
       .filter((check) => !check.allowed)
       .map((check) => `${check.command} (${check.reason ?? 'نامجاز'})`);
 
-    const quota = await checkActionsQuota(this.store, Number(this.env.ACTIONS_MONTHLY_MINUTE_LIMIT ?? 2000));
+    const quota = await checkActionsQuota(
+      this.store,
+      Number(this.env.ACTIONS_MONTHLY_MINUTE_LIMIT ?? 100),
+      commands.length ? RUN_RESERVATION_MINUTES : 0,
+    );
     const tests: ExecutionResult['tests'] = { dispatched: false, rejectedCommands };
 
-    if (quota.level === 'blocked') {
+    if (!commands.length) {
+      tests.note = 'هیچ دستور تستی در لیست مجاز برای این پروژه تعریف نشده است';
+    } else if (quota.level === 'blocked') {
       tests.note = `سقف ${quota.limitMinutes} دقیقه Actions این ماه پر شده (${Math.round(quota.usedMinutes)} دقیقه مصرف شده). اجرای تست در صف منتظر ماه بعد یا افزایش سقف است.`;
       await this.store.audit(actor, 'actions.quota_blocked', String(pullRequest.number), quota);
-    } else if (commands.length) {
+    } else {
       const job = await this.store.enqueue({ requestId: request.id, kind: 'tests', payload: { owner, repo, branch, commands } });
-      const previousMinutes = await this.dispatcher.recentMinutes(owner, repo, branch).catch(() => [] as number[]);
-      const estimate = estimateRunMinutes(previousMinutes);
-      if (quota.remainingMinutes < estimate) {
-        tests.note = `دقیقه باقیمانده Actions (${quota.remainingMinutes}) کمتر از برآورد این اجرا (${estimate}) است؛ قبل از اجرا به شما اطلاع داده می‌شود.`;
-      }
-      const dispatch = await this.dispatcher.dispatch({ owner, repo, branch, jobId: job.id, requestId: request.id, commands });
+      const dispatch = await this.dispatcher.dispatch({
+        owner,
+        repo,
+        branch,
+        jobId: job.id,
+        requestId: request.id,
+        commands,
+        reservedMinutes: RUN_RESERVATION_MINUTES,
+      });
       tests.dispatched = Boolean(dispatch.runId);
       tests.runId = dispatch.runId;
       tests.url = dispatch.url;
@@ -211,8 +226,6 @@ export class ExecutionEngine {
       }
       await this.store.setJobStatus(job.id, tests.outcome?.conclusion === 'success' ? 'succeeded' : 'failed', tests.outcome?.conclusion ?? tests.note);
       await this.store.addJobLog(job.id, 'info', 'نتیجه اجرای تست', { conclusion: tests.outcome?.conclusion ?? null, minutes: tests.outcome?.minutes ?? 0 });
-    } else {
-      tests.note = 'هیچ دستور تستی در لیست مجاز برای این پروژه تعریف نشده است';
     }
 
     await this.store.addMemory(project.id, 'decision', `تغییرات ${changedFiles.join(', ')} روی شاخه ${branch} و PR #${pullRequest.number}`, request.id);

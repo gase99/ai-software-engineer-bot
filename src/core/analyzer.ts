@@ -3,7 +3,7 @@ import type { Store } from '../db/store.js';
 import type { FileChange, PlanContent, RequestRow } from '../types.js';
 import { buildAnalysisMessages, buildCodeMessages } from './prompts.js';
 import { buildContext, detectStack, type RepoSnapshot } from './context.js';
-import { validateRepoPath } from './patch.js';
+import { isSensitiveRepoPath, validateRepoPath } from './patch.js';
 import { isCommandAllowed, parseAllowlist } from '../github/commands.js';
 import { scanForInjection } from '../security/promptGuard.js';
 import { logger } from '../util/log.js';
@@ -86,7 +86,11 @@ export class AnalysisEngine {
   async analyze(request: RequestRow, snapshot: RepoSnapshot, memory: string[] = []): Promise<AnalysisResult> {
     const stack = detectStack(snapshot.tree, snapshot.files);
     const context = buildContext(snapshot, request.raw_text);
-    const injectionFindings = scanForInjection(`${request.raw_text}\n${Object.values(snapshot.files).join('\n').slice(0, 20_000)}`);
+    const scannableContent = Object.entries(snapshot.files)
+      .filter(([path]) => !isSensitiveRepoPath(path))
+      .map(([, content]) => content)
+      .join('\n');
+    const injectionFindings = scanForInjection(`${request.raw_text}\n${scannableContent.slice(0, 20_000)}`);
 
     const completion = await this.manager.complete({
       messages: buildAnalysisMessages({
@@ -155,7 +159,9 @@ export class AnalysisEngine {
         }
       })
       .filter((change): change is FileChange => Boolean(change))
-      .filter((change) => input.plan.files.includes(change.path) || change.action === 'create');
+      // Creation is not an escape hatch: every action, including create, must
+      // stay inside the exact scope approved by the owner.
+      .filter((change) => input.plan.files.includes(change.path));
 
     if (!changes.length) throw new Error('مدل هیچ تغییر معتبری تولید نکرد');
     return { changes, tests: asStringArray(parsed.tests), notes: String(parsed.notes ?? '') };

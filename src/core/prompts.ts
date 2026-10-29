@@ -56,7 +56,7 @@ export function buildAnalysisMessages(input: {
         wrapUntrusted('owner_request', input.requestText, 4000),
         '',
         `دستور تست پیشنهادی پروژه: ${input.testCommand}`,
-        input.memory.length ? `حافظه پروژه:\n${input.memory.join('\n')}` : '',
+        input.memory.length ? `حافظه پروژه:\n${wrapUntrusted('project_memory', input.memory.join('\n'), 8000)}` : '',
         '',
         'وضعیت فعلی مخزن:',
         input.context,

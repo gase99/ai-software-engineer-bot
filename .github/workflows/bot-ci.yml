@@ -14,28 +14,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Unit + integration tests
-        run: npm test
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Security gates come before dependency installation and test execution.
       - name: Secret hygiene (no keys committed)
         run: |
           set -e
-          if git grep -nIE '(AIza[0-9A-Za-z_-]{20,}|gsk_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' \
-              -- . ':(exclude).github/workflows/bot-ci.yml' ':(exclude)test/*' ; then
+          if git grep -nIE '(AIza[0-9A-Za-z_-]{20,}|gsk_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' \
+              -- . ':(exclude).github/workflows/bot-ci.yml' ':(exclude)test/*' ':(exclude)package-lock.json' ; then
             echo "::error::possible secret found in the repository"
             exit 1
           fi
           echo "no secrets found"
+
+      - name: Sandbox workflow policy
+        run: |
+          set -e
+          if grep -nE '\([[:space:]]*eval[[:space:]]' .github/workflows/ai-exec.yml; then
+            echo "::error::eval is forbidden in the execution sandbox"
+            exit 1
+          fi
+          awk '/^  run:/{in_run=1} /^  report:/{in_run=0} in_run && /secrets\./{print; exit 1}' .github/workflows/ai-exec.yml
+          grep -q 'persist-credentials: false' .github/workflows/ai-exec.yml
+          grep -q 'run-name: ai-exec:' .github/workflows/ai-exec.yml
+
+      - name: Owner setup script syntax (never execute setup)
+        run: bash -n scripts/setup-owner.sh
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install the locked dependency graph
+        run: npm ci --no-audit --no-fund
+
+      - name: Dependency vulnerability gate (high and critical)
+        run: npm audit --audit-level=high
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit + integration tests
+        run: npm test
+
       - name: Enforce the execution allow-list
         run: |
-          # the sandbox workflow must keep the same allow-list as src/github/commands.ts
           node -e "
             const fs=require('fs');
             const wf=fs.readFileSync('.github/workflows/ai-exec.yml','utf8');

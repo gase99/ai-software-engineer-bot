@@ -1,5 +1,6 @@
 import type { GithubClient } from '../github/client.js';
 import { interestingFiles, rankFiles, type RepoSnapshot } from './context.js';
+import { isSensitiveRepoPath } from './patch.js';
 
 export interface SnapshotOptions {
   maxFiles?: number;
@@ -20,7 +21,7 @@ export async function takeSnapshot(
 ): Promise<RepoSnapshot> {
   const maxFiles = options.maxFiles ?? 12;
   const maxFileBytes = options.maxFileBytes ?? 200_000;
-  const tree = await client.getTree(owner, repo, branch);
+  const tree = (await client.getTree(owner, repo, branch)).filter((entry) => !isSensitiveRepoPath(entry.path));
   const ranked = (options.keywords?.length ? rankFiles(tree, options.keywords) : interestingFiles(tree)).slice(0, maxFiles);
 
   const files: Record<string, string> = {};

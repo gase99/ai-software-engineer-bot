@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createTestBot, OWNER_ID, update } from './helpers.js';
+import { parseCallbackData } from '../src/telegram/keyboard.js';
+import { routeUpdate } from '../src/telegram/router.js';
 
 const text = (value: string, messageId = 1) =>
   update({ update_id: messageId, message: { message_id: messageId, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: value } });
@@ -122,13 +124,44 @@ describe('Telegram interface in Persian (phase 1-3 deliverables)', () => {
     expect(audit.some((entry) => entry.action === 'document.accepted')).toBe(true);
   });
 
-  it('an ambiguous free-text message asks for confirmation instead of guessing', async () => {
-    const { bot, telegram } = await createTestBot({ aiReply: { text: 'ok' } });
-    await bot.handleUpdate(text('یه چیزی درست کن'));
+  it('preserves fenced code and outer whitespace while trimming only command routing', () => {
+    const raw = '  ```python\nif True:\n    print("ok")\n```  ';
+    expect(routeUpdate(text(raw))).toEqual({ kind: 'text', text: raw });
+
+    const command = routeUpdate(text('  /new   یک تست اضافه کن  '));
+    // Router keeps the leading slash by contract; Bot.runCommand strips it.
+    expect(command).toMatchObject({ kind: 'command', command: '/new', args: 'یک تست اضافه کن' });
+  });
+
+  it('confirms full free text with a short, signed, one-time callback', async () => {
+    const { bot, store, telegram } = await createTestBot({ aiReply: { text: 'ok' } });
+    const project = await store.createProject({ name: 'repo', owner: 'owner', repo: 'repo' });
+    await store.setSetting('active_project_id', project.id);
+    const original = `یه چیزی درست کن ${'با جزئیات کامل '.repeat(12)}`;
+    await bot.handleUpdate(text(original));
 
     const message = telegram.messages.at(-1)!;
     expect(message.text).toContain('درخواست جدید ثبت کنم');
     const markup = message.replyMarkup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
-    expect(markup.inline_keyboard[0]![0]!.callback_data).toContain('confirm');
+    const callbackData = markup.inline_keyboard[0]![0]!.callback_data;
+    expect(callbackData.length).toBeLessThanOrEqual(64);
+    expect(parseCallbackData(callbackData)).toMatchObject({ scope: 'newreq', action: 'confirm' });
+
+    const callback = (updateId: number) => ({
+      update_id: updateId,
+      callback_query: {
+        id: `confirm-${updateId}`,
+        from: { id: OWNER_ID },
+        data: callbackData,
+        message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' } },
+      },
+    });
+    await bot.handleUpdate(callback(2));
+    await bot.handleUpdate(callback(3));
+
+    const request = (await store.latestRequestForProject(project.id))!;
+    expect(request.raw_text).toBe(original);
+    expect(request.status).toBe('queued');
+    expect(await store.listJobs()).toHaveLength(1);
   });
 });

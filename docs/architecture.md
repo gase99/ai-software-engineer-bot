@@ -39,7 +39,7 @@
 ```
 /new <متن>
   │
-  ├─ createRequest(status=draft) ─▶ enqueue(job: analyze) ─▶ اجرا (inline یا کرون)
+  ├─ createRequest(status=queued) ─▶ enqueue(job: analyze) ─▶ اجرا توسط کرون
   │        └─ takeSnapshot ─▶ buildContext ─▶ ProviderManager.complete(jsonMode)
   │             └─ coercePlan (پاک‌سازی مسیرها و دستورها) ─▶ savePlan(version=n)
   │                  └─ renderPlanReport + issue(token) ─▶ پیام با ۴ دکمه

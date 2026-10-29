@@ -2,12 +2,25 @@ node_modules/
 dist/
 .wrangler/
 .dev.vars
+.dev.vars.*
+!.dev.vars.example
 .env
+.env.*
+!.env.example
 *.sqlite
 *.sqlite-journal
+*.sqlite-*
+backup-*.sql
 coverage/
 .DS_Store
 # Local secrets must never be committed
 *.pem
 *.key
 *.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+.netrc
+.npmrc
+.pypirc

@@ -3,6 +3,7 @@ import { createTestBot, OWNER_ID, planJson, update } from './helpers.js';
 import { extractJsonObject, coercePlan } from '../src/core/analyzer.js';
 import { detectStack, buildContext } from '../src/core/context.js';
 import { DEFAULT_ALLOWLIST } from '../src/github/commands.js';
+import { parseCallbackData } from '../src/telegram/keyboard.js';
 
 describe('analysis engine and plan report (acceptance tests 5, 9)', () => {
   it('produces a Persian plan report and waits for approval before touching the repo', async () => {
@@ -10,6 +11,7 @@ describe('analysis engine and plan report (acceptance tests 5, 9)', () => {
 
     await bot.handleUpdate(update({ message: { message_id: 1, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/project owner/repo' } }));
     await bot.handleUpdate(update({ update_id: 2, message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/new یک تابع تفریق اضافه کن' } }));
+    await bot.tick();
 
     const project = await store.getProject((await store.getActiveProjectId())!);
     const request = (await store.latestRequestForProject(project!.id))!;
@@ -28,7 +30,10 @@ describe('analysis engine and plan report (acceptance tests 5, 9)', () => {
     const withKeyboard = telegram.messages.filter((message) => message.replyMarkup).pop();
     const markup = withKeyboard?.replyMarkup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
     expect(markup.inline_keyboard[0]![0]!.text).toContain('تأیید و شروع');
-    expect(markup.inline_keyboard[0]![0]!.callback_data).toMatch(/^plan\|req_[\w-]+\|1\|approve\|[\w-]+\.[\w-]+$/);
+    const callbackData = markup.inline_keyboard[0]![0]!.callback_data;
+    const parsed = parseCallbackData(callbackData);
+    expect(callbackData.length).toBeLessThanOrEqual(64);
+    expect(parsed).toMatchObject({ scope: 'plan', action: 'approve', requestId: request.id, planVersion: 1 });
 
     // nothing was written to the repository yet
     expect(github.commits).toHaveLength(0);
@@ -39,6 +44,7 @@ describe('analysis engine and plan report (acceptance tests 5, 9)', () => {
 
     await bot.handleUpdate(update({ message: { message_id: 1, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/project owner/repo' } }));
     await bot.handleUpdate(update({ update_id: 2, message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/new یک ویژگی اضافه کن' } }));
+    await bot.tick();
 
     const text = telegram.messages.map((message) => message.text).join('\n');
     expect(text).toContain('تحلیل مخزن انجام نشد');
@@ -48,16 +54,22 @@ describe('analysis engine and plan report (acceptance tests 5, 9)', () => {
     expect(await store.latestPlan(request.id)).toBeNull();
   });
 
-  it('queues instead of spending when no free provider is available', async () => {
+  it('stops honestly instead of spending when no free provider is available', async () => {
     const { bot, store, telegram } = await createTestBot({ aiReply: { text: planJson() } });
     await store.sql.run('UPDATE providers SET daily_limit = 1 WHERE name = ?', ['gemini']);
     await store.recordUsage('gemini', 5, 5);
 
     await bot.handleUpdate(update({ message: { message_id: 1, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/project owner/repo' } }));
     await bot.handleUpdate(update({ update_id: 2, message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: '/new ویژگی جدید' } }));
+    await bot.tick();
 
     const text = telegram.messages.map((message) => message.text).join('\n');
     expect(text).toContain('هیچ ارائه‌دهنده رایگانی در دسترس نیست');
+    expect(text).toContain('failed');
+    const project = await store.getProject((await store.getActiveProjectId())!);
+    const request = (await store.latestRequestForProject(project!.id))!;
+    expect(request.status).toBe('failed');
+    expect(text).not.toContain('درخواست در صف ماند');
   });
 
   it('sanitises a plan: strips dangerous commands and unsafe paths', () => {

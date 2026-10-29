@@ -1,15 +1,11 @@
 name: AI Execution Sandbox
 
-# The bot dispatches this workflow (workflow_dispatch) to run whitelisted
-# tests/builds in a clean runner. It is the "sandbox" of Mode A: no Docker on
-# the bot host, no code executed inside the Worker.
+# Runs only allow-listed test/build commands on a short-lived GitHub runner.
+# Repository code is untrusted. It runs in the `run` job with contents:read and
+# no bot secrets. The callback token exists ONLY in the separate `report` job,
+# which never checks out or executes repository code.
 #
-# Hard limits implemented here:
-#   * only commands from ALLOWED_COMMANDS run (no shell metacharacters)
-#   * 15 minute job timeout
-#   * output capped at 100 KB
-#   * minimal GITHUB_TOKEN permissions (contents: read)
-#   * no secrets are exposed to the command step
+# آزمایش نشد — مالک باید اجرای واقعی این workflow را در مخزن هدف بررسی کند.
 
 on:
   workflow_dispatch:
@@ -23,9 +19,13 @@ on:
         required: false
         type: string
       commands:
-        description: "Newline separated, whitelisted commands"
+        description: "Newline separated, allow-listed commands"
         required: false
         type: string
+
+# Unique title lets the Worker attribute a run to the exact random job id,
+# rather than accidentally selecting another run on the same branch.
+run-name: ai-exec:${{ github.event.inputs.job_id }}
 
 permissions:
   contents: read
@@ -34,29 +34,31 @@ concurrency:
   group: ai-exec-${{ github.event.inputs.job_id }}
   cancel-in-progress: false
 
-env:
-  MAX_OUTPUT_BYTES: 102400
-
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      MAX_OUTPUT_BYTES: 102400
+      JOB_ID: ${{ github.event.inputs.job_id }}
+      REQUEST_ID: ${{ github.event.inputs.request_id }}
+      COMMANDS_INPUT: ${{ github.event.inputs.commands }}
     steps:
       - name: Checkout working branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Setup Node (if a Node project)
         if: hashFiles('package.json') != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup Python (if a Python project)
         if: hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != ''
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
 
@@ -70,7 +72,7 @@ jobs:
           if [ -f pyproject.toml ]; then pip install . ; fi
           exit 0
 
-      - name: Validate and run whitelisted commands
+      - name: Validate and run allow-listed commands
         id: execute
         run: |
           set -uo pipefail
@@ -80,16 +82,18 @@ jobs:
             "cargo test" "go test ./..." "mvn -q test" "yarn test" "pnpm test"
           )
           MAX_OUTPUT_BYTES="${MAX_OUTPUT_BYTES:-102400}"
-          printf '%s' "${{ github.event.inputs.commands }}" > /tmp/commands.txt
+          # Inputs arrive through the environment, never through direct
+          # expression interpolation into shell source code.
+          printf '%s' "$COMMANDS_INPUT" > /tmp/commands.txt
           : > /tmp/output.txt
           STATUS="success"
+          RAN_COUNT=0
           REJECTED="[]"
 
-          reject() { REJECTED="$(printf '%s' "$REJECTED" | jq -c --arg c "$1" --arg r "$2" '. + [{command:$c,reason:$r}]' 2>/dev/null || echo '[{"command":"'$1'","reason":"'$2'"}]')"; }
+          reject() { REJECTED="$(printf '%s' "$REJECTED" | jq -c --arg c "$1" --arg r "$2" '. + [{command:$c,reason:$r}]')"; }
 
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
-            # no shell metacharacters, ever
             if printf '%s' "$cmd" | grep -qE '[;&|`$><(){}]'; then
               reject "$cmd" "shell metacharacter"; continue
             fi
@@ -98,21 +102,24 @@ jobs:
               if [ "$cmd" = "$candidate" ] || [[ "$cmd" == "$candidate "* ]]; then allowed=true; break; fi
             done
             if [ "$allowed" != true ]; then
-              reject "$cmd" "not allowlisted"; continue
+              reject "$cmd" "not allow-listed"; continue
             fi
             echo "### running: $cmd" >> /tmp/output.txt
+            read -r -a COMMAND_ARGS <<< "$cmd"
             set +e
-            ( eval "$cmd" ) >> /tmp/output.txt 2>&1
+            # No eval: shell syntax can never be introduced by a model.
+            "${COMMAND_ARGS[@]}" >> /tmp/output.txt 2>&1
             code=$?
             set -e
+            RAN_COUNT=$((RAN_COUNT + 1))
             echo "### exit_code: $code" >> /tmp/output.txt
             if [ "$code" -ne 0 ]; then STATUS="failure"; fi
           done < /tmp/commands.txt
+          if [ "$RAN_COUNT" -eq 0 ]; then STATUS="failure"; fi
 
-          # cap output
           if [ "$(wc -c < /tmp/output.txt)" -gt "$MAX_OUTPUT_BYTES" ]; then
             head -c "$MAX_OUTPUT_BYTES" /tmp/output.txt > /tmp/output.capped.txt
-            echo -e "\n...[output truncated at ${MAX_OUTPUT_BYTES} bytes]" >> /tmp/output.capped.txt
+            printf '\n...[output truncated]\n' >> /tmp/output.capped.txt
             mv /tmp/output.capped.txt /tmp/output.txt
           fi
 
@@ -123,41 +130,65 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+          # Make the real GitHub conclusion agree with the test result. Output
+          # variables alone must never turn a failed test suite into success.
+          if [ "$STATUS" != "success" ]; then exit 1; fi
+
       - name: Emit structured JSON log
+        if: ${{ always() }}
+        env:
+          EXEC_STATUS: ${{ steps.execute.outputs.status }}
+          EXEC_REJECTED: ${{ steps.execute.outputs.rejected }}
         run: |
           jq -n \
-            --arg job_id "${{ github.event.inputs.job_id }}" \
-            --arg request_id "${{ github.event.inputs.request_id }}" \
-            --arg status "${{ steps.execute.outputs.status }}" \
+            --arg job_id "$JOB_ID" \
+            --arg request_id "$REQUEST_ID" \
+            --arg status "$EXEC_STATUS" \
             --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --rawfile output /tmp/output.txt \
-            --arg rejected "${{ steps.execute.outputs.rejected }}" \
+            --arg rejected "$EXEC_REJECTED" \
             '{ts: (now|todate), job_id:$job_id, request_id:$request_id, level:"info", event:"ai_exec.finished", status:$status, run_url:$run_url, output:($output[0:4000]), rejected:$rejected}' \
             >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
       - name: Upload output artifact
-        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ai-exec-output-${{ github.event.inputs.job_id }}
           path: /tmp/output.txt
           if-no-files-found: ignore
 
+  report:
+    # This job has no checkout and executes no repository-controlled code, so
+    # writing GITHUB_ENV/GITHUB_PATH from tests cannot expose the callback token.
+    if: ${{ always() && vars.BOT_CALLBACK_URL != '' }}
+    needs: run
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    env:
+      BOT_CALLBACK_URL: ${{ vars.BOT_CALLBACK_URL }}
+      ACTIONS_CALLBACK_TOKEN: ${{ secrets.ACTIONS_CALLBACK_TOKEN }}
+      JOB_ID: ${{ github.event.inputs.job_id }}
+      REQUEST_ID: ${{ github.event.inputs.request_id }}
+      RUN_RESULT: ${{ needs.run.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
       - name: Report result to the bot
-        if: ${{ vars.BOT_CALLBACK_URL != '' }}
-        env:
-          BOT_CALLBACK_URL: ${{ vars.BOT_CALLBACK_URL }}
-          ACTIONS_CALLBACK_TOKEN: ${{ secrets.ACTIONS_CALLBACK_TOKEN }}
         run: |
-          STATUS="${{ steps.execute.outputs.status }}"
+          case "$BOT_CALLBACK_URL" in
+            https://*) ;;
+            *) echo "BOT_CALLBACK_URL must use HTTPS"; exit 1 ;;
+          esac
           BODY=$(jq -n \
-            --arg job_id "${{ github.event.inputs.job_id }}" \
-            --arg request_id "${{ github.event.inputs.request_id }}" \
+            --arg jobId "$JOB_ID" \
+            --arg requestId "$REQUEST_ID" \
             --arg status "completed" \
-            --arg conclusion "$STATUS" \
-            --rawfile log /tmp/output.txt \
-            '{jobId:$job_id, requestId:$request_id, status:$status, conclusion:$conclusion, log:($log[0:4000])}')
-          curl -sS -X POST "$BOT_CALLBACK_URL" \
+            --arg conclusion "$RUN_RESULT" \
+            --arg log "$RUN_URL" \
+            '{jobId:$jobId, requestId:$requestId, status:$status, conclusion:$conclusion, log:$log}')
+          curl --fail-with-body -sS --max-time 20 -X POST "$BOT_CALLBACK_URL" \
             -H 'content-type: application/json' \
             -H "x-actions-token: $ACTIONS_CALLBACK_TOKEN" \
             -d "$BODY" || echo "callback failed (bot may be offline)"

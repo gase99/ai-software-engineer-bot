@@ -1,7 +1,7 @@
 import type { GithubClient, WorkflowRun } from './client.js';
 import type { Store } from '../db/store.js';
 import { buildCommandScript, parseAllowlist } from './commands.js';
-import { recordRunMinutes } from './quota.js';
+import { recordRunMinutes, releaseActionsReservation } from './quota.js';
 import { GithubError } from './client.js';
 
 export interface DispatchInput {
@@ -12,6 +12,8 @@ export interface DispatchInput {
   requestId: string;
   commands: string[];
   workflowFile?: string;
+  /** Minutes already reserved atomically by the caller. */
+  reservedMinutes?: number;
 }
 
 export interface DispatchResult {
@@ -50,6 +52,7 @@ export class ActionsDispatcher {
   async dispatch(input: DispatchInput): Promise<DispatchResult> {
     const { script, rejected } = buildCommandScript(input.commands, this.allowlist());
     const workflowFile = input.workflowFile ?? 'ai-exec.yml';
+    const reservedMinutes = Math.max(0, Math.ceil(input.reservedMinutes ?? 0));
     try {
       await this.client.dispatchWorkflow({
         owner: input.owner,
@@ -62,12 +65,11 @@ export class ActionsDispatcher {
           commands: script,
         },
       });
-      const run = await this.waitForRun(input.owner, input.repo, input.branch, input.jobId);
-      return { runId: run?.id ?? null, url: run?.html_url ?? null, usedFallback: false, rejectedCommands: rejected };
     } catch (error) {
+      // The API rejected the dispatch, so no run should exist. Release only
+      // this pre-dispatch reservation; failures after acceptance stay reserved.
+      if (reservedMinutes) await releaseActionsReservation(this.store, reservedMinutes);
       const err = error as GithubError;
-      // A repository without the ai-exec workflow is common: report it clearly
-      // instead of pretending tests ran.
       return {
         runId: null,
         url: null,
@@ -76,13 +78,35 @@ export class ActionsDispatcher {
         note: err.message,
       };
     }
+
+    try {
+      const run = await this.waitForRun(input.owner, input.repo, input.branch, input.jobId);
+      if (run && reservedMinutes) {
+        await this.store.setSetting(`actions_reservation:run:${run.id}`, String(reservedMinutes));
+      }
+      // If the run cannot be found yet, keep the reservation. Releasing it
+      // could exceed the monthly cap when GitHub starts the run shortly after.
+      return { runId: run?.id ?? null, url: run?.html_url ?? null, usedFallback: false, rejectedCommands: rejected };
+    } catch (error) {
+      const err = error as GithubError;
+      return {
+        runId: null,
+        url: null,
+        usedFallback: false,
+        rejectedCommands: rejected,
+        note: `Workflow dispatched، اما شناسه اجرا خوانده نشد: ${err.message}`,
+      };
+    }
   }
 
   /** Find the run created for our dispatch by matching the job_id in the title. */
   private async waitForRun(owner: string, repo: string, branch: string, jobId: string, attempts = 3): Promise<WorkflowRun | null> {
     for (let attempt = 0; attempt < attempts; attempt++) {
       const runs = await this.client.listWorkflowRuns(owner, repo, branch, 10);
-      const match = runs.find((run) => run.head_branch === branch);
+      const expectedTitle = `ai-exec:${jobId}`;
+      const match = runs.find(
+        (run) => run.head_branch === branch && run.display_title === expectedTitle && (!run.event || run.event === 'workflow_dispatch'),
+      );
       if (match) return match;
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
@@ -93,7 +117,7 @@ export class ActionsDispatcher {
     const run = await this.client.getWorkflowRun(owner, repo, runId);
     const jobs = await this.client.getRunJobs(owner, repo, runId);
     const finished = run.status === 'completed';
-    const minutes = finished ? await recordRunMinutes(this.store, run.run_started_at, run.updated_at) : 0;
+    const minutes = finished ? await recordRunMinutes(this.store, run.run_started_at, run.updated_at, runId) : 0;
     return {
       status: run.status,
       conclusion: run.conclusion,

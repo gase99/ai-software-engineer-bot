@@ -14,6 +14,7 @@ import type {
   RequestStatus,
 } from '../types.js';
 import { randomId } from '../util/crypto.js';
+import { redact, redactObject } from '../security/redact.js';
 
 export interface NewJob {
   requestId?: string | null;
@@ -94,7 +95,16 @@ export class Store {
     return this.sql.get<RequestRow>('SELECT * FROM requests WHERE id = ?', [id]);
   }
 
-  async setRequestStatus(id: string, status: RequestStatus): Promise<void> {
+  async setRequestStatus(id: string, status: RequestStatus, options: { currentPlanVersion?: number } = {}): Promise<void> {
+    if (options.currentPlanVersion !== undefined) {
+      await this.sql.run('UPDATE requests SET status = ?, current_plan_version = ?, updated_at = ? WHERE id = ?', [
+        status,
+        options.currentPlanVersion,
+        this.now(),
+        id,
+      ]);
+      return;
+    }
     await this.sql.run('UPDATE requests SET status = ?, updated_at = ? WHERE id = ?', [status, this.now(), id]);
   }
 
@@ -161,18 +171,29 @@ export class Store {
 
   async getApproval(requestId: string, planVersion: number): Promise<ApprovalRow | null> {
     return this.sql.get<ApprovalRow>(
-      'SELECT * FROM approvals WHERE request_id = ? AND plan_version = ? ORDER BY id DESC LIMIT 1',
+      'SELECT * FROM approvals WHERE request_id = ? AND plan_version = ? ORDER BY rowid DESC LIMIT 1',
       [requestId, planVersion],
     );
   }
 
-  async decideApproval(id: string, status: 'approved' | 'rejected' | 'expired', actor: string): Promise<void> {
-    await this.sql.run('UPDATE approvals SET status = ?, decided_at = ?, actor = ? WHERE id = ?', [
+  /** Invalidate every older pending button whenever a fresh one is issued. */
+  async supersedePendingApprovals(requestId: string): Promise<void> {
+    await this.sql.run(
+      "UPDATE approvals SET status = 'superseded', decided_at = ?, actor = 'system' WHERE request_id = ? AND status = 'pending'",
+      [this.now(), requestId],
+    );
+  }
+
+  /** Consume a pending approval atomically; a concurrent second click loses. */
+  async decideApproval(id: string, status: 'approved' | 'rejected' | 'expired', actor: string): Promise<boolean> {
+    const result = await this.sql.run('UPDATE approvals SET status = ?, decided_at = ?, actor = ? WHERE id = ? AND status = ?', [
       status,
       this.now(),
       actor,
       id,
+      'pending',
     ]);
+    return result.changes > 0;
   }
 
   // ----------------------------------------------------------------- jobs
@@ -225,7 +246,7 @@ export class Store {
   async setJobStatus(id: string, status: JobStatus, error?: string): Promise<void> {
     await this.sql.run('UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?', [
       status,
-      error ?? null,
+      error ? redact(error) : null,
       this.now(),
       id,
     ]);
@@ -233,7 +254,7 @@ export class Store {
 
   async completeJob(id: string, result: unknown): Promise<void> {
     await this.sql.run("UPDATE jobs SET status = 'succeeded', result_json = ?, updated_at = ? WHERE id = ?", [
-      JSON.stringify(result ?? null),
+      JSON.stringify(redactObject(result ?? null)),
       this.now(),
       id,
     ]);
@@ -245,7 +266,7 @@ export class Store {
     const nextStatus: JobStatus = job.attempts >= job.max_attempts ? 'dead' : 'failed';
     await this.sql.run('UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ?', [
       nextStatus,
-      error,
+      redact(error),
       new Date(Date.now() + retryDelayMs).toISOString(),
       this.now(),
       id,
@@ -262,8 +283,8 @@ export class Store {
     await this.sql.run('INSERT INTO job_logs (job_id, level, message, meta_json, created_at) VALUES (?,?,?,?,?)', [
       jobId,
       level,
-      message,
-      meta ? JSON.stringify(meta) : null,
+      redact(message),
+      meta ? JSON.stringify(redactObject(meta)) : null,
       this.now(),
     ]);
   }
@@ -334,6 +355,25 @@ export class Store {
   }
 
   // ----------------------------------------------------------------- usage
+  /** Atomically reserve one outbound AI call across ALL providers for today. */
+  async reserveDailyAiRequest(limit: number, day = new Date().toISOString().slice(0, 10)): Promise<boolean> {
+    const cap = Math.floor(limit);
+    if (!Number.isFinite(cap) || cap <= 0) return false;
+    const id = `ai_daily:${day}`;
+    const result = await this.sql.run(
+      `INSERT INTO rate_counters (id, window_start, count) VALUES (?,?,1)
+       ON CONFLICT(id) DO UPDATE SET count = count + 1
+       WHERE rate_counters.count < ?`,
+      [id, Date.parse(`${day}T00:00:00Z`), cap],
+    );
+    return result.changes > 0;
+  }
+
+  async dailyAiRequestCount(day = new Date().toISOString().slice(0, 10)): Promise<number> {
+    const row = await this.sql.get<{ count: number | null }>('SELECT count FROM rate_counters WHERE id = ?', [`ai_daily:${day}`]);
+    return row?.count ?? 0;
+  }
+
   async recordUsage(provider: string, inputTokens: number, outputTokens: number, estimatedCostUsd = 0): Promise<void> {
     const day = new Date().toISOString().slice(0, 10);
     const month = day.slice(0, 7);
@@ -359,6 +399,14 @@ export class Store {
       [provider, day],
     );
     return row?.total ?? 0;
+  }
+
+  async requestsForDay(provider: string, day = new Date().toISOString().slice(0, 10)): Promise<number> {
+    const row = await this.sql.get<{ requests: number | null }>(
+      'SELECT requests FROM api_usage WHERE provider = ? AND day = ?',
+      [provider, day],
+    );
+    return row?.requests ?? 0;
   }
 
   async usageForMonth(provider: string, month = new Date().toISOString().slice(0, 7)): Promise<number> {
@@ -401,11 +449,32 @@ export class Store {
   // ------------------------------------------------------- actions minutes
   async addActionsMinutes(minutes: number): Promise<void> {
     const month = new Date().toISOString().slice(0, 7);
+    if (minutes < 0) {
+      await this.sql.run('UPDATE github_actions_usage SET minutes = MAX(0, minutes + ?), updated_at = ? WHERE month = ?', [
+        minutes,
+        this.now(),
+        month,
+      ]);
+      return;
+    }
     await this.sql.run(
       `INSERT INTO github_actions_usage (month, minutes, updated_at) VALUES (?,?,?)
-       ON CONFLICT(month) DO UPDATE SET minutes = minutes + excluded.minutes, updated_at = excluded.updated_at`,
+       ON CONFLICT(month) DO UPDATE SET minutes = MAX(0, minutes + excluded.minutes), updated_at = excluded.updated_at`,
       [month, minutes, this.now()],
     );
+  }
+
+  /** Atomically reserve estimated minutes before any workflow dispatch. */
+  async reserveActionsMinutes(minutes: number, limit: number): Promise<boolean> {
+    if (!Number.isFinite(minutes) || minutes <= 0 || !Number.isFinite(limit) || limit <= 0 || minutes > limit) return false;
+    const month = new Date().toISOString().slice(0, 7);
+    const result = await this.sql.run(
+      `INSERT INTO github_actions_usage (month, minutes, updated_at) VALUES (?,?,?)
+       ON CONFLICT(month) DO UPDATE SET minutes = minutes + excluded.minutes, updated_at = excluded.updated_at
+       WHERE github_actions_usage.minutes + excluded.minutes <= ?`,
+      [month, minutes, this.now(), limit],
+    );
+    return result.changes > 0;
   }
 
   async actionsMinutesThisMonth(): Promise<number> {
@@ -437,8 +506,8 @@ export class Store {
     await this.sql.run('INSERT INTO audit_log (actor, action, target, meta_json, created_at) VALUES (?,?,?,?,?)', [
       actor,
       action,
-      target ?? null,
-      meta ? JSON.stringify(meta) : null,
+      target ? redact(target) : null,
+      meta ? JSON.stringify(redactObject(meta)) : null,
       this.now(),
     ]);
   }
@@ -458,6 +527,25 @@ export class Store {
       'INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
       [key, value, this.now()],
     );
+  }
+
+  /** Insert a durable idempotency marker exactly once. */
+  async claimOnce(key: string): Promise<boolean> {
+    const result = await this.sql.run(
+      'INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO NOTHING',
+      [key, '1', this.now()],
+    );
+    return result.changes > 0;
+  }
+
+  async deleteSetting(key: string): Promise<void> {
+    await this.sql.run('DELETE FROM settings WHERE key = ?', [key]);
+  }
+
+  /** Atomically consume a one-time setting; only one concurrent caller wins. */
+  async consumeSetting(key: string): Promise<boolean> {
+    const result = await this.sql.run('DELETE FROM settings WHERE key = ?', [key]);
+    return result.changes > 0;
   }
 
   async getActiveProjectId(): Promise<string | null> {

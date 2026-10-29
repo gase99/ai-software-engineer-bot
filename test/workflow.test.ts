@@ -30,7 +30,9 @@ describe('GitHub Actions execution sandbox (acceptance test 18)', () => {
       expect(workflow.includes(`"${command}"`), `missing in workflow allow-list: ${command}`).toBe(true);
     }
     expect(workflow).toContain('shell metacharacter');
-    expect(workflow).toContain('not allowlisted');
+    expect(workflow).toContain('not allow-listed');
+    expect(workflow).not.toContain('( eval');
+    expect(workflow).toContain('COMMANDS_INPUT');
   });
 
   it('emits a structured JSON log and reports back to the bot over a protected callback', () => {
@@ -40,13 +42,22 @@ describe('GitHub Actions execution sandbox (acceptance test 18)', () => {
     expect(workflow).toContain('ACTIONS_CALLBACK_TOKEN');
   });
 
-  it('checks out without persisting credentials', () => {
+  it('checks out without persisting credentials and isolates the callback secret', () => {
     expect(workflow).toContain('persist-credentials: false');
+    const runJob = workflow.split('\n  run:')[1]!.split('\n  report:')[0]!;
+    const reportJob = workflow.split('\n  report:')[1]!;
+    expect(runJob).not.toContain('secrets.');
+    expect(reportJob).toContain('secrets.ACTIONS_CALLBACK_TOKEN');
+    expect(reportJob).not.toContain('actions/checkout');
+    expect(workflow).toContain('run-name: ai-exec:');
   });
 
   it('CI runs typecheck and the test suite on every pull request', () => {
     expect(ci).toContain('npm run typecheck');
     expect(ci).toContain('npm test');
     expect(ci).toContain('pull_request');
+    expect(ci.indexOf('Secret hygiene')).toBeLessThan(ci.indexOf('npm ci'));
+    expect(ci).toContain('bash -n scripts/setup-owner.sh');
+    expect(ci).not.toContain('bash scripts/setup-owner.sh');
   });
 });

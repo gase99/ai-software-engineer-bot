@@ -39,6 +39,8 @@ export interface WorkflowRun {
   run_started_at?: string;
   updated_at?: string;
   head_branch?: string;
+  display_title?: string;
+  event?: string;
 }
 
 export class GithubError extends Error {
