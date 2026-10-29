@@ -55,6 +55,7 @@ export default {
       }
       const update = (await request.json().catch(() => null)) as TelegramUpdate | null;
       if (!update) return json({ ok: false, error: 'invalid payload' }, 400);
+      console.log("INCOMING UPDATE:", JSON.stringify(update));
 
       const bot = await Bot.create(env);
       ctx.waitUntil(
