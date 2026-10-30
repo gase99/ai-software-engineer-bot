@@ -1,10 +1,15 @@
 import type { TelegramUpdate } from './api.js';
-import { normalizeFa } from '../util/text.js';
-import { MAIN_MENU } from './keyboard.js';
 
+/**
+ * Update routing.
+ *
+ * There is no menu and no bot-side conversation state machine any more: free
+ * text (and any unlisted `/command`) is forwarded to the conversational agent.
+ * Only `/start` and `/cancel` are first-class commands; everything else is an
+ * optional shortcut handled by `Bot.runCommand`.
+ */
 export type Route =
   | { kind: 'command'; command: string; args: string; text: string }
-  | { kind: 'menu'; label: string }
   | { kind: 'callback'; data: string }
   | { kind: 'document'; fileId: string; fileName: string; fileSize: number; caption?: string }
   | { kind: 'text'; text: string }
@@ -28,7 +33,7 @@ export function routeUpdate(update: TelegramUpdate): Route {
 
   const rawText = message.text ?? message.caption ?? '';
   // Trim is a routing concern only. Free-text requests may contain fenced
-  // code or significant whitespace and must reach the request store verbatim.
+  // code or significant whitespace and must reach the agent verbatim.
   const text = rawText.trim();
   if (!text) return { kind: 'unknown' };
 
@@ -36,13 +41,6 @@ export function routeUpdate(update: TelegramUpdate): Route {
     const [rawCommand, ...rest] = text.split(/\s+/);
     const command = (rawCommand ?? '').replace(/@[\w_]+$/, '').toLowerCase();
     return { kind: 'command', command, args: rest.join(' ').trim(), text };
-  }
-
-  const normalized = normalizeFa(text);
-  for (const row of MAIN_MENU) {
-    for (const label of row) {
-      if (normalizeFa(label) === normalized) return { kind: 'menu', label };
-    }
   }
 
   return { kind: 'text', text: rawText };

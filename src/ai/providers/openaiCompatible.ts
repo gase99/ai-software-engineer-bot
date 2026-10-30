@@ -1,10 +1,56 @@
 import { postJson } from '../http.js';
-import type { AiCompletion, AiCompletionRequest, ProviderHealth } from '../types.js';
+import type { AiCompletion, AiCompletionRequest, AiMessage, AiToolCall, ProviderHealth } from '../types.js';
 import { AiProviderError } from '../types.js';
 
+interface ChatToolCall {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+}
+
 interface ChatResponse {
-  choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+  choices?: Array<{
+    message?: { content?: string | null; tool_calls?: ChatToolCall[] };
+    finish_reason?: string;
+  }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+}
+
+/** OpenAI-style messages: `tool_calls` on the assistant, `tool_call_id` on the result. */
+function toOpenAiMessages(messages: AiMessage[]): Array<Record<string, unknown>> {
+  return messages.map((message) => {
+    if (message.role === 'tool') {
+      return {
+        role: 'tool',
+        tool_call_id: message.toolCallId ?? message.toolName ?? 'tool',
+        content: message.content || '(empty result)',
+      };
+    }
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      return {
+        role: 'assistant',
+        content: message.content || null,
+        tool_calls: message.toolCalls.map((call) => ({
+          id: call.id,
+          type: 'function',
+          function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+        })),
+      };
+    }
+    return { role: message.role, content: message.content };
+  });
+}
+
+function parseArguments(raw: string | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    // A malformed argument string must never crash the turn; the tool layer
+    // will reject the call and the model sees a normal error result.
+    return { __raw: raw };
+  }
 }
 
 /**
@@ -24,11 +70,18 @@ export async function completeOpenAiCompatible(input: {
 }): Promise<AiCompletion> {
   const body: Record<string, unknown> = {
     model: input.model,
-    messages: input.request.messages.map((m) => ({ role: m.role, content: m.content })),
+    messages: toOpenAiMessages(input.request.messages),
     temperature: input.request.temperature ?? 0.2,
     max_tokens: input.request.maxOutputTokens ?? 4096,
   };
   if (input.request.jsonMode) body.response_format = { type: 'json_object' };
+  if (input.request.tools?.length) {
+    body.tools = input.request.tools.map((tool) => ({
+      type: 'function',
+      function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+    }));
+    body.tool_choice = 'auto';
+  }
 
   const data = await postJson<ChatResponse>({
     url: `${input.baseUrl}/chat/completions`,
@@ -45,15 +98,27 @@ export async function completeOpenAiCompatible(input: {
     fetchImpl: input.fetchImpl,
   });
 
-  const text = data.choices?.[0]?.message?.content ?? '';
-  if (!text) throw new AiProviderError(`${input.provider} returned an empty completion`, input.provider, 502, true);
+  const choice = data.choices?.[0];
+  const text = (choice?.message?.content ?? '').trim();
+  const toolCalls: AiToolCall[] = (choice?.message?.tool_calls ?? [])
+    .filter((call) => call.function?.name)
+    .map((call, index) => ({
+      id: call.id ?? `${input.provider}_${index}`,
+      name: call.function!.name as string,
+      arguments: parseArguments(call.function!.arguments),
+    }));
+
+  if (!text && !toolCalls.length) {
+    throw new AiProviderError(`${input.provider} returned an empty completion`, input.provider, 502, true);
+  }
   return {
     text,
+    toolCalls: toolCalls.length ? toolCalls : undefined,
     inputTokens: data.usage?.prompt_tokens ?? 0,
     outputTokens: data.usage?.completion_tokens ?? 0,
     provider: input.provider,
     model: input.model,
-    finishReason: data.choices?.[0]?.finish_reason,
+    finishReason: choice?.finish_reason,
   };
 }
 

@@ -1,16 +1,23 @@
 import type { InlineKeyboardButton } from './api.js';
 
-export const MAIN_MENU = [
-  ['پروژه‌های من', 'درخواست جدید'],
-  ['ادامه قبلی', 'انتخاب مدل'],
-  ['تنظیمات API', 'اتصال GitHub'],
-  ['وضعیت وظایف', 'تاریخچه'],
-  ['گزارش تست‌ها', 'تنظیمات امنیتی'],
-  ['راهنما'],
-];
-
-export function mainMenuKeyboard() {
-  return { keyboard: MAIN_MENU.map((row) => row.map((label) => ({ text: label }))), resize_keyboard: true, is_persistent: true };
+/**
+ * The bot has no reply keyboard / menu any more: the interaction model is free
+ * text. The only keyboards left are the inline confirmations below.
+ */
+export function agentApprovalKeyboard(actionId: string): { inline_keyboard: InlineKeyboardButton[][] } {
+  const yes = `ag|${actionId}|y`;
+  const no = `ag|${actionId}|n`;
+  if ([yes, no].some((data) => new TextEncoder().encode(data).length > 64)) {
+    throw new Error('callback_data exceeds Telegram 64-byte limit');
+  }
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ بله، انجام بده', callback_data: yes },
+        { text: '❌ خیر', callback_data: no },
+      ],
+    ],
+  };
 }
 
 export type PlanAction = 'approve' | 'revise' | 'explain' | 'cancel';
@@ -56,23 +63,6 @@ export function planApprovalKeyboard(actions: PlanActions): { inline_keyboard: I
   };
 }
 
-export function confirmKeyboard(action: string, requestId: string, token: string): { inline_keyboard: InlineKeyboardButton[][] } {
-  if (action !== 'newreq') throw new Error(`unsupported confirmation scope: ${action}`);
-  const yes = `n|${requestId}|c|${token}`;
-  const no = `n|${requestId}|x|${token}`;
-  if ([yes, no].some((data) => new TextEncoder().encode(data).length > 64)) {
-    throw new Error('callback_data exceeds Telegram 64-byte limit');
-  }
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ بله، ادامه بده', callback_data: yes },
-        { text: '🚫 خیر', callback_data: no },
-      ],
-    ],
-  };
-}
-
 export function parseCallbackData(data: string): {
   scope: string;
   requestId: string;
@@ -89,6 +79,14 @@ export function parseCallbackData(data: string): {
     const action = actionCode ? PLAN_ACTION_NAMES[actionCode] : undefined;
     if (!requestId || !Number.isInteger(planVersion) || planVersion <= 0 || !action || !token) return null;
     return { scope: 'plan', requestId, planVersion, action, token };
+  }
+
+  // Conversational-agent approval: ag|<actionId>|y|n
+  if (parts[0] === 'ag' && parts.length === 3) {
+    const [, actionId, decision] = parts;
+    const action = decision === 'y' ? 'approve' : decision === 'n' ? 'reject' : undefined;
+    if (!actionId || !action) return null;
+    return { scope: 'agent', requestId: actionId, action, token: '' };
   }
 
   // Current compact free-text confirmation callback.

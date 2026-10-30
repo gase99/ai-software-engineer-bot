@@ -2,10 +2,12 @@ import { SCHEMA_SQL } from './schema.js';
 import type { Sql } from './sql.js';
 import type {
   ApprovalRow,
+  ChatMessageRow,
   FileChange,
   JobKind,
   JobRow,
   JobStatus,
+  PendingActionRow,
   PlanContent,
   PlanRow,
   Project,
@@ -33,8 +35,10 @@ export class Store {
    * first.
    */
   async init(): Promise<void> {
+    // Probe the newest table: a database created before the conversational
+    // agent existed already has `projects` but not `chat_messages`.
     const existing = await this.sql.get<{ name: string }>(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chat_messages'",
     );
     if (existing) return;
     await this.sql.exec(SCHEMA_SQL);
@@ -550,6 +554,103 @@ export class Store {
 
   async getActiveProjectId(): Promise<string | null> {
     return this.getSetting('active_project_id');
+  }
+
+  // ---------------------------------------------------- chat memory (agent)
+  async addChatMessage(input: {
+    telegramUserId: string | number;
+    chatId: string | number;
+    role: string;
+    content: string;
+    messageJson: string;
+  }): Promise<void> {
+    await this.sql.run(
+      'INSERT INTO chat_messages (telegram_user_id, chat_id, role, content, message_json, created_at) VALUES (?,?,?,?,?,?)',
+      [String(input.telegramUserId), String(input.chatId), input.role, input.content, redact(input.messageJson), this.now()],
+    );
+  }
+
+  /** Newest `limit` messages, oldest first, ready to replay to the model. */
+  async listChatMessages(telegramUserId: string | number, limit = 40): Promise<ChatMessageRow[]> {
+    const rows = await this.sql.all<ChatMessageRow>(
+      'SELECT * FROM chat_messages WHERE telegram_user_id = ? ORDER BY id DESC LIMIT ?',
+      [String(telegramUserId), limit],
+    );
+    return rows.reverse();
+  }
+
+  async countChatMessages(telegramUserId: string | number): Promise<number> {
+    const row = await this.sql.get<{ total: number | null }>(
+      'SELECT COUNT(*) AS total FROM chat_messages WHERE telegram_user_id = ?',
+      [String(telegramUserId)],
+    );
+    return row?.total ?? 0;
+  }
+
+  /** Keep the conversation bounded so D1 free-tier reads stay cheap. */
+  async trimChatMessages(telegramUserId: string | number, keep = 200): Promise<number> {
+    const result = await this.sql.run(
+      'DELETE FROM chat_messages WHERE telegram_user_id = ? AND id NOT IN ' +
+        '(SELECT id FROM chat_messages WHERE telegram_user_id = ? ORDER BY id DESC LIMIT ?)',
+      [String(telegramUserId), String(telegramUserId), keep],
+    );
+    return result.changes;
+  }
+
+  async clearChatMessages(telegramUserId: string | number): Promise<number> {
+    const result = await this.sql.run('DELETE FROM chat_messages WHERE telegram_user_id = ?', [String(telegramUserId)]);
+    return result.changes;
+  }
+
+  // ------------------------------------------------- pending agent actions
+  async createPendingAction(input: {
+    id?: string;
+    telegramUserId: string | number;
+    chatId: string | number;
+    summary: string;
+    callsJson: string;
+    expiresAt: string;
+  }): Promise<PendingActionRow> {
+    const id = input.id ?? randomId('act');
+    const now = this.now();
+    // Only one decision can wait at a time per owner.
+    await this.supersedePendingActions(input.telegramUserId);
+    await this.sql.run(
+      'INSERT INTO pending_actions (id, telegram_user_id, chat_id, summary, calls_json, status, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      [id, String(input.telegramUserId), String(input.chatId), input.summary, input.callsJson, 'pending', input.expiresAt, now],
+    );
+    return (await this.sql.get<PendingActionRow>('SELECT * FROM pending_actions WHERE id = ?', [id])) as PendingActionRow;
+  }
+
+  async getPendingAction(id: string): Promise<PendingActionRow | null> {
+    return this.sql.get<PendingActionRow>('SELECT * FROM pending_actions WHERE id = ?', [id]);
+  }
+
+  async latestPendingAction(telegramUserId: string | number): Promise<PendingActionRow | null> {
+    return this.sql.get<PendingActionRow>(
+      "SELECT * FROM pending_actions WHERE telegram_user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+      [String(telegramUserId)],
+    );
+  }
+
+  /**
+   * Consume a pending action atomically: a fast double-click ("بله" twice, or
+   * the inline button plus a typed "بله") can only run the tools once.
+   */
+  async decidePendingAction(id: string, status: 'approved' | 'rejected' | 'expired' | 'superseded'): Promise<boolean> {
+    const result = await this.sql.run(
+      "UPDATE pending_actions SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+      [status, this.now(), id],
+    );
+    return result.changes > 0;
+  }
+
+  async supersedePendingActions(telegramUserId: string | number): Promise<number> {
+    const result = await this.sql.run(
+      "UPDATE pending_actions SET status = 'superseded', decided_at = ? WHERE telegram_user_id = ? AND status = 'pending'",
+      [this.now(), String(telegramUserId)],
+    );
+    return result.changes;
   }
 }
 

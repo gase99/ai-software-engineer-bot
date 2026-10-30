@@ -2,11 +2,14 @@
  * Canonical database schema (SQLite-compatible: runs on Cloudflare D1, Turso
  * and plain SQLite without modification).
  *
- * `migrations/0001_init.sql` must stay byte-equivalent to this constant -
+ * `migrations/*.sql` must stay byte-equivalent to `SCHEMA_SQL` (the canonical
+ * schema is the concatenation of the migrations, in filename order) -
  * `test/schema.test.ts` enforces it, so the schema can never drift between the
- * D1 migration and the in-process SQLite used by the test-suite.
+ * D1 migrations and the in-process SQLite used by the test-suite.
  */
-export const SCHEMA_SQL = `-- 0001_init.sql - AI Software Engineer Bot
+import { AGENT_SCHEMA_SQL } from './agentSchema.js';
+
+export const INIT_SCHEMA_SQL = `-- 0001_init.sql - AI Software Engineer Bot
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -179,3 +182,9 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at TEXT NOT NULL
 );
 `;
+
+/**
+ * Canonical schema = every migration applied in order. Tests use this to build
+ * an in-memory database that is identical to a fully migrated D1 database.
+ */
+export const SCHEMA_SQL = `${INIT_SCHEMA_SQL}\n${AGENT_SCHEMA_SQL}`;

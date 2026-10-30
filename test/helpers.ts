@@ -192,6 +192,34 @@ export function mockGemini(mock: FetchMock, reply: AiReply | ((body: unknown) =>
   });
 }
 
+export interface GeminiTurn {
+  text?: string;
+  toolCalls?: Array<{ name: string; args?: Record<string, unknown> }>;
+}
+
+/**
+ * Scripted Gemini: every call consumes the next turn (the last one repeats).
+ * Used to exercise function calling end to end.
+ */
+export function mockGeminiTurns(mock: FetchMock, turns: GeminiTurn[]): { bodies: Array<Record<string, unknown>> } {
+  const bodies: Array<Record<string, unknown>> = [];
+  let index = 0;
+  mock.prepend(/generativelanguage\.googleapis\.com/, (_url, init) => {
+    const body = init.body ? (tryParseJson(String(init.body)) as Record<string, unknown>) : {};
+    bodies.push(body);
+    const turn = turns[Math.min(index, turns.length - 1)];
+    index += 1;
+    const parts: Array<Record<string, unknown>> = [];
+    if (turn?.text) parts.push({ text: turn.text });
+    for (const call of turn?.toolCalls ?? []) parts.push({ functionCall: { name: call.name, args: call.args ?? {} } });
+    return jsonResponse({
+      candidates: [{ content: { parts }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 },
+    });
+  });
+  return { bodies };
+}
+
 export function mockOpenAiCompatible(mock: FetchMock, hostPattern: RegExp, reply: AiReply | ((body: unknown) => AiReply)): void {
   mock.on(hostPattern, (_url, init) => {
     const body = init.body ? tryParseJson(String(init.body)) : undefined;

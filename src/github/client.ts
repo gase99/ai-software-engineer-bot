@@ -90,6 +90,55 @@ export class GithubClient {
     return this.request<GithubRepo>('GET', `/repos/${owner}/${repo}`);
   }
 
+  /** The account the current credential acts as (PAT user or App bot). */
+  async getAuthenticatedUser(): Promise<{ login: string }> {
+    return this.request<{ login: string }>('GET', '/user');
+  }
+
+  /**
+   * Create a repository for the authenticated account.
+   *
+   * A GitHub App installation token cannot create repositories at all - GitHub
+   * answers 403 and the tool layer turns that into a plain-language refusal.
+   */
+  async createRepo(input: { name: string; private?: boolean; description?: string; autoInit?: boolean }): Promise<GithubRepo & { html_url: string }> {
+    return this.request<GithubRepo & { html_url: string }>('POST', '/user/repos', {
+      name: input.name,
+      private: input.private ?? true,
+      description: input.description,
+      auto_init: input.autoInit ?? true,
+    });
+  }
+
+  /**
+   * Repositories this credential can see. Installation tokens cannot call
+   * `/user/repos`, so the installation endpoint is tried first and the user
+   * endpoint is the PAT fallback.
+   */
+  async listAccessibleRepos(limit = 30): Promise<GithubRepo[]> {
+    try {
+      const data = await this.request<{ repositories: GithubRepo[] }>('GET', `/installation/repositories?per_page=${limit}`);
+      if (Array.isArray(data?.repositories)) return data.repositories;
+    } catch {
+      // Not an installation token (or no installation scope): fall through.
+    }
+    const repos = await this.request<GithubRepo[]>('GET', `/user/repos?per_page=${limit}&sort=updated&affiliation=owner,collaborator,organization_member`);
+    return Array.isArray(repos) ? repos : [];
+  }
+
+  /** GitHub answers 403/404 for "no access" and 422 for "already exists". */
+  static describeError(error: unknown): string {
+    if (error instanceof GithubError) {
+      if (error.status === 401) return 'توکن گیت‌هاب معتبر نیست یا منقضی شده است.';
+      if (error.status === 403) return 'دسترسی لازم برای این عملیات در گیت‌هاب وجود ندارد (توکن یا App این اجازه را ندارد).';
+      if (error.status === 404) return 'مخزن یا فایل پیدا نشد، یا این توکن به آن دسترسی ندارد.';
+      if (error.status === 422) return 'گیت‌هاب این درخواست را نپذیرفت (مثلاً نام تکراری است یا شاخه وجود ندارد).';
+      if (error.status === 409) return 'این مخزن خالی است یا وضعیت آن با درخواست هم‌خوان نیست.';
+      return `گیت‌هاب خطا داد (${error.status ?? 'نامشخص'}): ${error.message}`;
+    }
+    return (error as Error).message;
+  }
+
   async getTree(owner: string, repo: string, branch: string): Promise<TreeEntry[]> {
     const data = await this.request<{ tree: TreeEntry[]; truncated: boolean }>(
       'GET',

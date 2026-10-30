@@ -1,6 +1,36 @@
+/** A single JSON-Schema-described tool the model may call. */
+export interface AiToolSpec {
+  name: string;
+  description: string;
+  /** JSON Schema for the arguments object (type: "object"). */
+  parameters: Record<string, unknown>;
+}
+
+/** A tool invocation requested by the model. */
+export interface AiToolCall {
+  /** Stable id used to correlate the call with its result. */
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+/**
+ * One turn of a conversation.
+ *
+ * `tool` messages carry the result of an `assistant` message that requested a
+ * tool call, so the model can see what happened before it answers.
+ */
 export interface AiMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /** Assistant only: the tool calls requested in this turn. */
+  toolCalls?: AiToolCall[];
+  /** Tool only: which call this result belongs to. */
+  toolCallId?: string;
+  /** Tool only: the tool name (Gemini needs it, OpenAI needs the id). */
+  toolName?: string;
+  /** Tool only: the result is an error / the capability is unavailable. */
+  toolError?: boolean;
 }
 
 export interface AiCompletionRequest {
@@ -10,10 +40,14 @@ export interface AiCompletionRequest {
   /** Hard deadline - a Worker invocation must never exceed its budget. */
   timeoutMs?: number;
   jsonMode?: boolean;
+  /** When set, the model may answer with text and/or tool calls. */
+  tools?: AiToolSpec[];
 }
 
 export interface AiCompletion {
   text: string;
+  /** Empty/undefined when the model answered with plain text. */
+  toolCalls?: AiToolCall[];
   inputTokens: number;
   outputTokens: number;
   provider: string;

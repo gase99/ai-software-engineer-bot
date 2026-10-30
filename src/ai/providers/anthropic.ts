@@ -1,11 +1,51 @@
 import { postJson } from '../http.js';
-import type { AiCompletion, AiCompletionRequest, ProviderHealth } from '../types.js';
+import type { AiCompletion, AiCompletionRequest, AiMessage, AiToolCall, ProviderHealth } from '../types.js';
 import { AiProviderError } from '../types.js';
 
+interface AnthropicBlock {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+  tool_use_id?: string;
+  content?: unknown;
+}
+
 interface AnthropicResponse {
-  content?: Array<{ type: string; text?: string }>;
+  content?: AnthropicBlock[];
   usage?: { input_tokens?: number; output_tokens?: number };
   stop_reason?: string;
+}
+
+/** Anthropic content blocks: `tool_use` out, `tool_result` back in. */
+function toAnthropicMessages(messages: AiMessage[]): Array<{ role: 'user' | 'assistant'; content: unknown }> {
+  return messages
+    .filter((message) => message.role !== 'system')
+    .map((message) => {
+      if (message.role === 'tool') {
+        return {
+          role: 'user' as const,
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: message.toolCallId ?? message.toolName ?? 'tool',
+              content: message.content || '(empty result)',
+              ...(message.toolError ? { is_error: true } : {}),
+            },
+          ],
+        };
+      }
+      if (message.role === 'assistant' && message.toolCalls?.length) {
+        const content: AnthropicBlock[] = [];
+        if (message.content) content.push({ type: 'text', text: message.content });
+        for (const call of message.toolCalls) {
+          content.push({ type: 'tool_use', id: call.id, name: call.name, input: call.arguments ?? {} });
+        }
+        return { role: 'assistant' as const, content };
+      }
+      return { role: message.role === 'assistant' ? ('assistant' as const) : ('user' as const), content: message.content };
+    });
 }
 
 /** Anthropic Messages API (paid, opt-in only - never used as a fallback). */
@@ -28,19 +68,38 @@ export async function completeAnthropic(input: {
       model: input.model,
       max_tokens: input.request.maxOutputTokens ?? 4096,
       ...(system ? { system } : {}),
-      messages: input.request.messages
-        .filter((m) => m.role !== 'system')
-        .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+      messages: toAnthropicMessages(input.request.messages),
+      ...(input.request.tools?.length
+        ? {
+            tools: input.request.tools.map((tool) => ({
+              name: tool.name,
+              description: tool.description,
+              input_schema: tool.parameters,
+            })),
+          }
+        : {}),
     },
     timeoutMs: input.timeoutMs,
     provider: 'anthropic',
     fetchImpl: input.fetchImpl,
   });
 
-  const text = (data.content ?? []).filter((c) => c.type === 'text').map((c) => c.text ?? '').join('');
-  if (!text) throw new AiProviderError('anthropic returned an empty completion', 'anthropic', 502, true);
+  const blocks = data.content ?? [];
+  const text = blocks.filter((c) => c.type === 'text').map((c) => c.text ?? '').join('').trim();
+  const toolCalls: AiToolCall[] = blocks
+    .filter((block) => block.type === 'tool_use' && block.name)
+    .map((block, index) => ({
+      id: block.id ?? `ant_${index}`,
+      name: block.name as string,
+      arguments: block.input ?? {},
+    }));
+
+  if (!text && !toolCalls.length) {
+    throw new AiProviderError('anthropic returned an empty completion', 'anthropic', 502, true);
+  }
   return {
     text,
+    toolCalls: toolCalls.length ? toolCalls : undefined,
     inputTokens: data.usage?.input_tokens ?? 0,
     outputTokens: data.usage?.output_tokens ?? 0,
     provider: 'anthropic',
