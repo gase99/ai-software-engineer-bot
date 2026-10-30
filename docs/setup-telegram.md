@@ -55,6 +55,8 @@ curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"
 ```
 
 فیلد `last_error_message` باید خالی باشد و `pending_update_count` باید کم باشد.
+در تنظیم پیش‌فرض `/telegram/webhook`، مسیر `/webhook` نیز با همان Secret پذیرفته
+می‌شود؛ اگر `WEBHOOK_PATH` را تغییر دهید، URL ثبت‌شده باید دقیقاً همان مسیر باشد.
 
 ## ۵. تست اولیه
 

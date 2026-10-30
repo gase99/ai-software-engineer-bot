@@ -9,11 +9,16 @@ interface ExecutionContext {
   passThroughOnException?(): void;
 }
 
+const DEFAULT_WEBHOOK_PATH = '/telegram/webhook';
+const DEFAULT_WEBHOOK_ALIAS = '/webhook';
+
 function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
+  const response = new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' },
   });
+  console.log('FETCH RESPONSE:', { status: response.status });
+  return response;
 }
 
 /**
@@ -26,6 +31,16 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     console.log("FETCH HANDLER STARTED");
     const url = new URL(request.url);
+    const webhookPath = env.WEBHOOK_PATH ?? DEFAULT_WEBHOOK_PATH;
+    const matchesConfiguredWebhookPath = url.pathname === webhookPath;
+    // The short path is an alias only for the default configuration. Explicit
+    // custom paths remain exclusive and all accepted paths still require the secret.
+    const matchesDefaultWebhookAlias = webhookPath === DEFAULT_WEBHOOK_PATH && url.pathname === DEFAULT_WEBHOOK_ALIAS;
+    console.log('FETCH ROUTE CHECK:', {
+      isPost: request.method === 'POST',
+      matchesConfiguredWebhookPath,
+      matchesDefaultWebhookAlias,
+    });
 
     if (request.method === 'GET' && url.pathname === '/health') {
       return json({ ok: true, service: 'ai-software-engineer-bot', time: new Date().toISOString() });
@@ -48,7 +63,7 @@ export default {
     }
 
     // Telegram webhook.
-    if (request.method === 'POST' && url.pathname === (env.WEBHOOK_PATH ?? '/telegram/webhook')) {
+    if (request.method === 'POST' && (matchesConfiguredWebhookPath || matchesDefaultWebhookAlias)) {
       const secret = request.headers.get('x-telegram-bot-api-secret-token') ?? '';
       const secretMatches = Boolean(env.TELEGRAM_WEBHOOK_SECRET) && (await safeEqual(secret, env.TELEGRAM_WEBHOOK_SECRET));
       console.log('WEBHOOK SECRET CHECK:', {
@@ -61,10 +76,19 @@ export default {
         return json({ ok: false, error: 'unauthorized' }, 401);
       }
       const update = (await request.json().catch(() => null)) as TelegramUpdate | null;
-      if (!update) return json({ ok: false, error: 'invalid payload' }, 400);
+      if (!update) {
+        logger.warn('webhook.invalid_payload');
+        return json({ ok: false, error: 'invalid payload' }, 400);
+      }
       console.log("INCOMING UPDATE:", JSON.stringify(update));
 
-      const bot = await Bot.create(env);
+      let bot: Bot;
+      try {
+        bot = await Bot.create(env);
+      } catch (error) {
+        logger.error('webhook.bot_init_failed');
+        throw error;
+      }
       ctx.waitUntil(
         bot.handleUpdate(update, { waitUntil: (promise) => ctx.waitUntil(promise) }).catch((error) =>
           logger.error('webhook.handler_failed', { error: (error as Error).message }),
@@ -83,7 +107,7 @@ export default {
       const body = (await request.json().catch(() => ({}))) as { url?: string };
       if (!body.url) return json({ ok: false, error: 'url required' }, 400);
       const bot = await Bot.create(env);
-      const path = env.WEBHOOK_PATH ?? '/telegram/webhook';
+      const path = webhookPath;
       await bot.telegram.setWebhook(`${body.url.replace(/\/$/, '')}${path}`, env.TELEGRAM_WEBHOOK_SECRET);
       await bot.telegram.setMyCommands([
         { command: 'projects', description: 'پروژه‌های من' },

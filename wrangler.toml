@@ -23,6 +23,7 @@ migrations_dir = "migrations"
 
 [vars]
 # Non-secret configuration. Secrets live in `wrangler secret put ...`
+# With this default, POST /webhook is also accepted; custom paths are exclusive.
 WEBHOOK_PATH = "/telegram/webhook"
 DEFAULT_BRANCH = "main"
 MAX_DIFF_BYTES = "90000"

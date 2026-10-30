@@ -41,7 +41,15 @@ describe('Worker fetch diagnostics', () => {
     );
 
     expect(response.status).toBe(status);
-    expect(log.mock.calls).toEqual([['FETCH HANDLER STARTED']]);
+    expect(log.mock.calls).toEqual([
+      ['FETCH HANDLER STARTED'],
+      ['FETCH ROUTE CHECK:', {
+        isPost: method === 'POST',
+        matchesConfiguredWebhookPath: path === (webhookPath ?? '/telegram/webhook'),
+        matchesDefaultWebhookAlias: (webhookPath ?? '/telegram/webhook') === '/telegram/webhook' && path === '/webhook',
+      }],
+      ['FETCH RESPONSE:', { status }],
+    ]);
   });
 
   it.each([
@@ -63,7 +71,9 @@ describe('Worker fetch diagnostics', () => {
     expect(await response.json()).toEqual({ ok: false, error: 'unauthorized' });
     expect(log.mock.calls).toEqual([
       ['FETCH HANDLER STARTED'],
+      ['FETCH ROUTE CHECK:', { isPost: true, matchesConfiguredWebhookPath: true, matchesDefaultWebhookAlias: false }],
       ['WEBHOOK SECRET CHECK:', { secretReceived: received, secretConfigured: present, matches: false }],
+      ['FETCH RESPONSE:', { status: 401 }],
     ]);
     expect(warn).toHaveBeenCalledOnce();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('webhook.bad_secret'));
@@ -89,11 +99,13 @@ describe('Worker fetch diagnostics', () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
-    expect(log.mock.calls.slice(0, 2)).toEqual([
+    expect(log.mock.calls.slice(0, 3)).toEqual([
       ['FETCH HANDLER STARTED'],
+      ['FETCH ROUTE CHECK:', { isPost: true, matchesConfiguredWebhookPath: true, matchesDefaultWebhookAlias: false }],
       ['WEBHOOK SECRET CHECK:', { secretReceived: true, secretConfigured: true, matches: true }],
     ]);
     expect(log).toHaveBeenCalledWith('INCOMING UPDATE:', JSON.stringify(update));
+    expect(log).toHaveBeenCalledWith('FETCH RESPONSE:', { status: 200 });
     expect(JSON.stringify(log.mock.calls)).not.toContain(token);
     expect(createBot).toHaveBeenCalledOnce();
     expect(handleUpdate).toHaveBeenCalledWith(update, { waitUntil: expect.any(Function) });
