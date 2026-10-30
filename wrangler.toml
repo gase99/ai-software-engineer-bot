@@ -32,6 +32,8 @@ AI_DAILY_REQUEST_LIMIT = "50"
 AI_DAILY_TOKEN_LIMIT = "500000"
 AI_MONTHLY_TOKEN_LIMIT = "10000000"
 ACTIONS_MONTHLY_MINUTE_LIMIT = "100"
+AUTO_START_REQUESTS = "1"
+CONVERSATION_HISTORY_TURNS = "8"
 COMMAND_ALLOWLIST = "npm test,npm run test,npm run lint,npm run build,npm run typecheck,npm ci,pytest,pytest -q,python -m pytest,cargo test,go test ./...,mvn -q test,yarn test,pnpm test"
 
 # Optional: KV is only needed if you want durable rate-limit counters across

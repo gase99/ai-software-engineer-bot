@@ -7,10 +7,21 @@ import { confirmKeyboard, mainMenuKeyboard, parseCallbackData, planApprovalKeybo
 import { routeUpdate, type Route } from './telegram/router.js';
 import { ProviderManager, type ProviderEvent } from './ai/registry.js';
 import { NoProviderAvailableError } from './ai/types.js';
-import { AnalysisEngine } from './core/analyzer.js';
+import { AnalysisEngine, extractJsonObject } from './core/analyzer.js';
 import { ApprovalError, ApprovalService } from './core/approval.js';
 import { ExecutionEngine } from './core/executor.js';
 import { renderPlanReport } from './core/report.js';
+import {
+  buildConversationMessages,
+  coerceRoute,
+  fallbackRoute,
+  CONFIDENCE_THRESHOLD,
+  GUARDED_INTENTS,
+  type ConversationContextInfo,
+  type ConversationIntent,
+  type ConversationRoute,
+  type ConversationTurn,
+} from './core/conversation.js';
 import { takeSnapshot } from './core/snapshot.js';
 import { GithubClient, GithubError } from './github/client.js';
 import { ActionsDispatcher } from './github/actions.js';
@@ -50,6 +61,28 @@ const MENU_TO_COMMAND: Record<string, string> = {
   'گزارش تست‌ها': '/tests',
   'تنظیمات امنیتی': '/security',
   'راهنما': '/help',
+};
+
+/** Conversation intents that are answered by an existing command. */
+const INTENT_COMMANDS: Partial<Record<ConversationIntent, string>> = {
+  status: '/status',
+  projects: '/projects',
+  add_project: '/project',
+  select_project: '/project',
+  models: '/models',
+  set_model: '/model',
+  provider: '/provider',
+  test_api: '/test_api',
+  github: '/github',
+  usage: '/usage',
+  tests: '/tests',
+  history: '/history',
+  security: '/security',
+  settings: '/settings',
+  help: '/help',
+  resume: '/resume',
+  cancel: '/cancel',
+  reject: '/cancel',
 };
 
 const COMMANDS = [
@@ -246,14 +279,30 @@ export class Bot {
         console.log("TRYING TO SEND REPLY...");
         await this.telegram.sendMessage(
           chatId,
-          'سلام 👋\nمن مهندس نرم‌افزار هوش مصنوعی شما هستم.\nدرخواستت را به فارسی ساده بنویس؛ من مخزن را تحلیل می‌کنم، طرح می‌دهم و بعد از تأیید خودت کد می‌نویسم، تست اجرا می‌کنم و Pull Request می‌سازم.\n\nهیچ تغییری بدون تأیید شما انجام نمی‌شود.',
+          'سلام 👋\nمن مهندس نرم‌افزار هوش مصنوعی شما هستم.\n\nهمین‌طور معمولی با من حرف بزن؛ هیچ دستور یا قالب خاصی لازم نیست. مثلاً بنویس:\n«این باگ لاگین رو درست کن»\n«وضعیت چیه؟»\n«یه تست برای تابع تفریق بنویس»\n\nمنظورت را می‌فهمم، مخزن را تحلیل می‌کنم، طرح می‌دهم و بعد از تأیید خودت کد می‌نویسم، تست اجرا می‌کنم و Pull Request می‌سازم.\nهیچ تغییری بدون تأیید تو انجام نمی‌شود.',
           { replyMarkup: mainMenuKeyboard() },
         );
         return;
       }
       case 'help': {
         const list = COMMANDS.map((item) => `/${item.command} — ${item.description}`).join('\n');
-        await this.reply(chatId, `📖 <b>فرمان‌ها</b>\n\n${escHtml(list)}\n\nهمچنین می‌توانی جمله‌ات را ساده بنویسی، مثلاً:\n«یک بخش لاگ اضافه کن که خطاها را ذخیره کند»`);
+        await this.reply(
+          chatId,
+          [
+            '📖 <b>چطور حرف بزنیم</b>',
+            '',
+            'هیچ فرمانی لازم نیست؛ هر چه می‌خواهی همان‌طور که با یک همکار حرف می‌زنی بنویس. مثال‌ها:',
+            '• «این باگ لاگین رو درست کن»',
+            '• «یه تست برای تابع تفریق بنویس»',
+            '• «وضعیت چیه؟ چقدر مصرف کردیم؟»',
+            '• «مدل رو بذار روی gemini-2.0-flash»',
+            '• «پروژه گیت‌هابم رو وصل کن owner/repo»',
+            '• «طرح رو ساده‌تر توضیح بده» / «باشه انجامش بده»',
+            '',
+            'این فرمان‌ها فقط میان‌بُر اختیاری‌اند:',
+            `<code>${escHtml(list)}</code>`,
+          ].join('\n'),
+        );
         return;
       }
       case 'projects': {
@@ -298,7 +347,7 @@ export class Bot {
         const text = args.trim();
         if (!text) {
           await this.setConversation(identity.telegramUserId, { state: 'awaiting_request' });
-          await this.reply(chatId, 'چه تغییری می‌خواهی؟ به فارسی ساده بنویس.');
+          await this.reply(chatId, 'چه تغییری می‌خواهی؟ همان‌طور که حرف می‌زنی بنویس.');
           return;
         }
         await this.startRequest(text, chatId, identity, context);
@@ -506,7 +555,10 @@ export class Bot {
         return;
       }
       default:
-        await this.reply(chatId, `فرمان ناشناس: /${escHtml(command)}\nبرای دیدن فرمان‌ها /help را بزن.`);
+        await this.reply(
+          chatId,
+          `فرمان ناشناس: /${escHtml(command)}\nلازم نیست فرمان بزنی؛ همان کار را مثل یک جملهٔ معمولی بنویس، مثلاً «وضعیت چیه؟» یا «این باگ رو درست کن».`,
+        );
     }
   }
 
@@ -523,6 +575,14 @@ export class Bot {
   }
 
   // -------------------------------------------------------------- free text
+  /**
+   * Everything the owner types outside a slash command lands here.
+   *
+   * Nothing is matched against a fixed phrase list: the message is routed by
+   * the AI (intent + natural answer in one call), so the owner can talk
+   * normally — "سلام"، "وضعیت چیه؟"، "این باگ رو درست کن"، "مدل رو عوض کن".
+   * Slash commands keep working as optional shortcuts, never as a requirement.
+   */
   private async handleFreeText(text: string, chatId: number, identity: Identity, context: BotContext): Promise<void> {
     const conversation = await this.getConversation(identity.telegramUserId);
 
@@ -538,32 +598,225 @@ export class Bot {
       return;
     }
 
-    if (isExplicitApproval(text)) {
-      const project = await this.activeProject();
-      const request = project ? await this.store.latestRequestForProject(project.id) : null;
-      if (request && request.status === 'awaiting_approval') {
-        await this.reply(chatId, 'برای اطمینان، دکمه «تأیید و شروع» زیر همان طرح را بزن (تأیید شفاهی کافی نیست).');
-        await this.sendPlanMessage(request, chatId);
-        return;
-      }
+    const history = await this.getHistory(identity.telegramUserId);
+    const route = await this.routeConversation(text, history, identity.telegramUserId);
+    await this.dispatchConversation(route, text, chatId, identity, context, history);
+  }
+
+  /** Ask the model for intent + reply; fall back to the deterministic router. */
+  private async routeConversation(text: string, history: ConversationTurn[], userId: number): Promise<ConversationRoute> {
+    const contextInfo = await this.conversationContext(userId);
+    try {
+      const completion = await this.providers.complete({
+        messages: buildConversationMessages({ text, history, context: contextInfo }),
+        jsonMode: true,
+        temperature: 0.3,
+        maxOutputTokens: 700,
+        timeoutMs: 30_000,
+      });
+      return coerceRoute(extractJsonObject(completion.text), text);
+    } catch (error) {
+      // Chat must stay usable on a free tier that ran out of quota: the rules
+      // router understands the everyday cases without spending a token.
+      logger.warn('conversation.route_fallback', { error: (error as Error).message });
+      return fallbackRoute(text);
+    }
+  }
+
+  private async conversationContext(userId: number): Promise<ConversationContextInfo> {
+    const project = await this.activeProject();
+    const provider = await this.providers.activeProvider();
+    const request = project ? await this.store.latestRequestForProject(project.id) : null;
+    const planRow = request ? await this.store.latestPlan(request.id) : null;
+    const jobs = await this.store.listJobs(undefined, 3);
+    const lastExecution = jobs.find((job) => job.kind === 'execute');
+    const pendingRaw = await this.store.getSetting(`pending:newreq:${userId}`);
+    let pendingQuestion: ConversationContextInfo['pendingQuestion'] = null;
+    try {
+      const parsed = pendingRaw ? (JSON.parse(pendingRaw) as { text?: string }) : null;
+      if (parsed?.text) pendingQuestion = { requestId: '…', text: truncate(parsed.text, 200) };
+    } catch {
+      pendingQuestion = null;
     }
 
-    if (isRejection(text)) {
-      await this.runCommand('/cancel', '', chatId, identity, context);
+    return {
+      activeProject: project ? `${project.repo_owner}/${project.repo_name}` : null,
+      branch: project?.default_branch ?? null,
+      lastRequest: request ? truncate(request.raw_text, 200) : null,
+      lastRequestStatus: request?.status ?? null,
+      lastPlanSummary: planRow ? truncate(StoreType.parsePlan(planRow).understanding, 200) : null,
+      lastExecution: lastExecution ? `${lastExecution.kind}:${lastExecution.status}` : null,
+      provider: provider ? `${provider.name}/${provider.model}` : null,
+      waitingForApproval: request?.status === 'awaiting_approval',
+      pendingQuestion,
+    };
+  }
+
+  private async dispatchConversation(
+    route: ConversationRoute,
+    text: string,
+    chatId: number,
+    identity: Identity,
+    context: BotContext,
+    history: ConversationTurn[],
+  ): Promise<void> {
+    const actor = String(identity.telegramUserId);
+    await this.store.audit(actor, `conversation.${route.intent}`, text.slice(0, 120), { confidence: route.confidence, source: route.source });
+
+    const confident = route.confidence >= CONFIDENCE_THRESHOLD;
+    const reply = route.reply.trim();
+    const say = async (message: string) => {
+      if (!message) return;
+      await this.reply(chatId, escHtml(message));
+    };
+
+    // Guarded intents are only honoured when the router is sure; a shaky
+    // guess must never cancel a plan or spend an AI request.
+    if (GUARDED_INTENTS.has(route.intent) && !confident && route.intent !== 'new_request') {
+      await say(reply || 'دقیقاً متوجه نشدم؛ می‌خواهی همین کار را انجام بدهم یا فقط داشتی توضیح می‌دادی؟');
+      await this.rememberTurn(identity.telegramUserId, history, [
+        { role: 'user', content: text },
+        { role: 'assistant', content: reply },
+      ]);
       return;
     }
 
+    if (route.intent === 'chat') {
+      const answer = reply || 'من اینجام؛ هر چی می‌خواهی همان‌طور که حرف می‌زنی بنویس.';
+      await say(answer);
+      await this.rememberTurn(identity.telegramUserId, history, [
+        { role: 'user', content: text },
+        { role: 'assistant', content: answer },
+      ]);
+      return;
+    }
+
+    if (route.intent === 'new_request') {
+      await this.rememberTurn(identity.telegramUserId, history, [{ role: 'user', content: text }]);
+      if (confident && this.autoStartRequests()) {
+        if (reply) await say(reply);
+        await this.startRequest(this.withConversationContext(text, history), chatId, identity, context);
+        return;
+      }
+      await this.confirmNewRequest(text, reply, chatId, identity);
+      return;
+    }
+
+    if (route.intent === 'approve') {
+      const project = await this.activeProject();
+      const request = project ? await this.store.latestRequestForProject(project.id) : null;
+      if (request && request.status === 'awaiting_approval') {
+        // A sentence is never an approval: re-show the signed button instead.
+        await say(reply || 'باشه! برای اینکه مطمئن باشیم، دکمه «تأیید و شروع» را زیر همین طرح بزن.');
+        await this.sendPlanMessage(request, chatId);
+      } else {
+        await say(reply || 'الان طرحی در انتظار تأیید نیست. اگر کاری داری، همان را ساده بگو تا برایت طرح بسازم.');
+      }
+      return;
+    }
+
+    if (route.intent === 'explain') {
+      const project = await this.activeProject();
+      const request = project ? await this.store.latestRequestForProject(project.id) : null;
+      const planRow = request ? await this.store.latestPlan(request.id) : null;
+      if (request && planRow) {
+        if (reply) await say(reply);
+        await this.explainPlan(request.id, planRow.version, chatId);
+      } else {
+        await say(reply || 'هنوز طرحی نداریم که توضیح بدهم.');
+      }
+      return;
+    }
+
+    const command = INTENT_COMMANDS[route.intent];
+    if (!command) {
+      await say(reply || 'متوجه نشدم؛ می‌شود ساده‌تر بگویی چه کاری می‌خواهی؟');
+      return;
+    }
+
+    // Read-only and preference intents run straight away; a short natural
+    // acknowledgement keeps the conversation feeling like a chat.
+    if (reply && route.intent !== 'help') await say(reply);
+    await this.rememberTurn(identity.telegramUserId, history, [
+      { role: 'user', content: text },
+      reply ? { role: 'assistant', content: reply } : null,
+    ].filter((turn): turn is ConversationTurn => Boolean(turn)));
+    await this.runCommand(command, await this.argsForIntent(route), chatId, identity, context);
+  }
+
+  /**
+   * A short follow-up ("همون قبلی، ولی با تست") only makes sense with the
+   * previous turns. They are appended as context, not merged into the request
+   * text, so the plan report still shows what the owner actually typed.
+   */
+  private withConversationContext(text: string, history: ConversationTurn[]): string {
+    if (text.length > 120 || !history.length) return text;
+    const context = history
+      .slice(-4)
+      .map((turn) => `${turn.role === 'user' ? 'مالک' : 'ربات'}: ${truncate(turn.content, 220)}`)
+      .join('\n');
+    return `${text}\n\n[زمینهٔ گفت‌وگو برای درک بهتر درخواست]\n${context}`;
+  }
+
+  private async argsForIntent(route: ConversationRoute): Promise<string> {
+    if (route.intent === 'add_project' || route.intent === 'select_project') {
+      const repo = /([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/.exec(route.args);
+      if (repo) return repo[1]!;
+      // "پروژه فروشگاه رو انتخاب کن" → resolve the spoken name to owner/repo.
+      if (route.intent === 'select_project' && route.args) {
+        const needle = route.args.toLowerCase();
+        const match = (await this.store.listProjects()).find(
+          (project) =>
+            project.name.toLowerCase() === needle ||
+            `${project.repo_owner}/${project.repo_name}`.toLowerCase() === needle,
+        );
+        if (match) return `${match.repo_owner}/${match.repo_name}`;
+      }
+      return route.args;
+    }
+    if (route.intent === 'set_model') {
+      const model = /([A-Za-z0-9_.:-]+)/.exec(route.args);
+      return model ? model[1]! : route.args;
+    }
+    if (route.intent === 'provider') return route.args.toLowerCase();
+    return '';
+  }
+
+  /** Signed, one-time confirmation — used only when the router is unsure. */
+  private async confirmNewRequest(text: string, reply: string, chatId: number, identity: Identity): Promise<void> {
     const nonce = randomToken(12);
     const token = await this.signAction('newreq', nonce);
     await this.store.setSetting(
       `pending:newreq:${identity.telegramUserId}`,
       JSON.stringify({ text, nonce, expiresAt: Date.now() + 10 * 60_000 }),
     );
-    await this.reply(
-      chatId,
-      `می‌خواهی این را به‌عنوان درخواست جدید ثبت کنم؟\n\n«${escHtml(truncate(text, 300))}»`,
-      confirmKeyboard('newreq', nonce, token),
-    );
+    const question = reply
+      ? `${escHtml(reply)}\n\nمی‌خواهی این را به‌عنوان درخواست جدید ثبت کنم؟`
+      : 'می‌خواهی این را به‌عنوان درخواست جدید ثبت کنم؟';
+    await this.reply(chatId, `${question}\n\n«${escHtml(truncate(text, 300))}»`, confirmKeyboard('newreq', nonce, token));
+  }
+
+  private autoStartRequests(): boolean {
+    return num(this.env, 'AUTO_START_REQUESTS', 1) === 1;
+  }
+
+  private async getHistory(userId: number): Promise<ConversationTurn[]> {
+    const raw = await this.store.getSetting(`chatlog:${userId}`);
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw) as ConversationTurn[];
+      return Array.isArray(parsed) ? parsed.filter((t) => t?.role === 'user' || t?.role === 'assistant') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Remember the last turns so "همون قبلی" / "نه، اون یکی" still makes sense. */
+  private async rememberTurn(userId: number, history: ConversationTurn[], turns: ConversationTurn[]): Promise<void> {
+    if (!turns.length) return;
+    const limit = Math.max(2, num(this.env, 'CONVERSATION_HISTORY_TURNS', 8));
+    const next = [...history, ...turns].slice(-limit);
+    await this.store.setSetting(`chatlog:${userId}`, JSON.stringify(next));
   }
 
   private async handleDocument(fileName: string, fileSize: number, chatId: number, identity: Identity): Promise<void> {
