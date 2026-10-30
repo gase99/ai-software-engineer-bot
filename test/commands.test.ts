@@ -7,18 +7,14 @@ const text = (value: string, messageId = 1) =>
   update({ update_id: messageId, message: { message_id: messageId, date: 0, chat: { id: OWNER_ID, type: 'private' }, from: { id: OWNER_ID }, text: value } });
 
 describe('Telegram interface in Persian (phase 1-3 deliverables)', () => {
-  it('/start shows the Persian main menu', async () => {
+  it('/start greets the owner in Persian and ships no command menu', async () => {
     const { bot, telegram } = await createTestBot({ aiReply: { text: 'ok' } });
     await bot.handleUpdate(text('/start'));
 
     const message = telegram.messages.at(-1)!;
     expect(message.text).toContain('مهندس نرم‌افزار هوش مصنوعی');
-    const keyboard = message.replyMarkup as { keyboard: Array<Array<{ text: string }>> };
-    const labels = keyboard.keyboard.flat().map((button) => button.text);
-    expect(labels).toContain('پروژه‌های من');
-    expect(labels).toContain('درخواست جدید');
-    expect(labels).toContain('انتخاب مدل');
-    expect(labels).toContain('گزارش تست‌ها');
+    // The conversation is free text now: no reply keyboard / menu is attached.
+    expect(message.replyMarkup).toBeUndefined();
   });
 
   it('/help lists the commands', async () => {
@@ -93,10 +89,12 @@ describe('Telegram interface in Persian (phase 1-3 deliverables)', () => {
     expect(telegram.messages.at(-1)!.text).toContain('ارائه‌دهنده‌ها');
   });
 
-  it('an unknown command is handled gracefully', async () => {
-    const { bot, telegram } = await createTestBot({ aiReply: { text: 'ok' } });
+  it('an unknown slash command is forwarded to the agent instead of erroring', async () => {
+    const { bot, telegram, mock } = await createTestBot({ aiReply: { text: 'این را به‌عنوان درخواست فهمیدم.' } });
     await bot.handleUpdate(text('/doesnotexist'));
-    expect(telegram.messages.at(-1)!.text).toContain('فرمان ناشناس');
+
+    expect(telegram.messages.at(-1)!.text).toContain('درخواست فهمیدم');
+    expect(JSON.stringify(mock.lastCallTo('generativelanguage')!.body)).toContain('/doesnotexist');
   });
 
   it('accepts a text file and rejects oversized or binary uploads', async () => {
@@ -134,35 +132,22 @@ describe('Telegram interface in Persian (phase 1-3 deliverables)', () => {
     expect(command).toMatchObject({ kind: 'command', command: '/new', args: 'یک تست اضافه کن' });
   });
 
-  it('confirms full free text with a short, signed, one-time callback', async () => {
-    const { bot, store, telegram } = await createTestBot({ aiReply: { text: 'ok' } });
+  it('sends free text straight to the conversational agent', async () => {
+    const { bot, store, telegram, mock } = await createTestBot({ aiReply: { text: 'حتماً، انجامش می‌دهم.' } });
     const project = await store.createProject({ name: 'repo', owner: 'owner', repo: 'repo' });
     await store.setSetting('active_project_id', project.id);
+
     const original = `یه چیزی درست کن ${'با جزئیات کامل '.repeat(12)}`;
     await bot.handleUpdate(text(original));
 
+    // No confirmation button and no legacy request row: the agent answers directly.
     const message = telegram.messages.at(-1)!;
-    expect(message.text).toContain('درخواست جدید ثبت کنم');
-    const markup = message.replyMarkup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
-    const callbackData = markup.inline_keyboard[0]![0]!.callback_data;
-    expect(callbackData.length).toBeLessThanOrEqual(64);
-    expect(parseCallbackData(callbackData)).toMatchObject({ scope: 'newreq', action: 'confirm' });
-
-    const callback = (updateId: number) => ({
-      update_id: updateId,
-      callback_query: {
-        id: `confirm-${updateId}`,
-        from: { id: OWNER_ID },
-        data: callbackData,
-        message: { message_id: 2, date: 0, chat: { id: OWNER_ID, type: 'private' } },
-      },
-    });
-    await bot.handleUpdate(callback(2));
-    await bot.handleUpdate(callback(3));
-
-    const request = (await store.latestRequestForProject(project.id))!;
-    expect(request.raw_text).toBe(original);
-    expect(request.status).toBe('queued');
-    expect(await store.listJobs()).toHaveLength(1);
+    expect(message.text).toContain('انجامش می‌دهم');
+    expect(message.replyMarkup).toBeUndefined();
+    expect(await store.listJobs()).toHaveLength(0);
+    const stored = await store.listChatMessages(OWNER_ID);
+    expect(stored[0]!.content).toBe(original);
+    // The active project is part of the runtime context handed to the model.
+    expect(JSON.stringify(mock.lastCallTo('generativelanguage')!.body)).toContain('owner/repo');
   });
 });

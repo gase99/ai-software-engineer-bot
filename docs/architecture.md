@@ -18,7 +18,7 @@
 
 | # | جزء | فایل(ها) | مسئولیت |
 |---|---|---|---|
-| ۱ | Telegram Interface | `src/telegram/api.ts`, `router.ts`, `keyboard.ts`, `src/index.ts` | وب‌هوک، ارسال/ویرایش پیام، کیبورد فارسی |
+| ۱ | Telegram Interface | `src/telegram/api.ts`, `router.ts`, `keyboard.ts`, `src/index.ts` | وب‌هوک، ارسال/ویرایش پیام، تأییدهای اینلاین (بدون منو) |
 | ۲ | Auth & Authorization | `src/security/auth.ts` | فقط `OWNER_TELEGRAM_ID`؛ بررسی سمت سرور |
 | ۳ | Project Registry | `src/db/store.ts` (جدول `projects`, `github_repos`) | ثبت و انتخاب پروژه |
 | ۴ | AI Provider Manager | `src/ai/registry.ts`, `providers/*`, `usage.ts` | انتخاب مدل، سقف رایگان، جایگزینی، مصرف |
@@ -33,8 +33,30 @@
 | ۱۳ | Logging & Audit | `src/util/log.ts`, جدول `audit_log`, `job_logs` | لاگ JSON ساختاریافته و ردپای حسابرسی |
 | ۱۴ | Cost & Usage Tracking | جدول `api_usage`, `github_actions_usage` | سقف روزانه/ماهانه و هشدار |
 | ۱۵ | Config & Secrets | `src/env.ts`, `wrangler.toml`, `.dev.vars` | تنظیمات غیرمحرمانه + اسرار پلتفرم |
+| ۱۶ | Conversational Agent | `src/agent/*` | حلقهٔ Function Calling، ابزارها، تأیید مکالمه‌ای |
+| ۱۷ | Chat Memory | جدول‌های `chat_messages`, `pending_actions`, `src/agent/memory.ts` | حافظهٔ گفتگو و درخواست‌های در انتظار تأیید |
 
-## جریان یک درخواست
+## ایجنت مکالمه‌ای (مسیر اصلی)
+
+```
+پیام آزاد (مثل «یک مخزن به اسم test-app بساز»)
+  │
+  ├─ chat_messages: ذخیرهٔ پیام کاربر
+  ├─ system prompt (وضعیت تازه) + ۳۰ پیام آخر حافظه + tools
+  ├─ ProviderManager.complete(tools=…)  ⇐ Gemini/OpenAI-compatible/Anthropic
+  │     ├─ متن؟ ─▶ پاسخ نهایی به مالک
+  │     └─ tool_call؟
+  │           ├─ حساس (مخزن/کامیت/PR/تست) ─▶ pending_actions + سؤال «آیا موافقی؟»
+  │           │        └─ «بله»/دکمه ─▶ decide(): اجرا + بازگشت نتیجه به مدل
+  │           └─ فقط‌خواندنی ─▶ اجرا + بازگشت نتیجه به مدل (حلقه تا ۵ گام)
+  └─ ابزار در دسترس نیست ─▶ نتیجه به مدل ─▶ «من دسترسی ندارم و نمی‌توانم…»
+```
+
+جزئیات کامل: [`agent.md`](agent.md).
+
+## جریان «حالت برنامه‌ریز» (میان‌بر اختیاری `/new`)
+
+این مسیر قدیمی هنوز کار می‌کند و برای تغییرات بزرگ چندفایلی مفید است؛ ولی دیگر پیش‌فرض نیست.
 
 ```
 /new <متن>

@@ -3,10 +3,14 @@ import { num } from './env.js';
 import { Store } from './db/store.js';
 import { d1Sql, type Sql } from './db/sql.js';
 import { TelegramClient, TelegramError, type TelegramMessage, type TelegramUpdate } from './telegram/api.js';
-import { confirmKeyboard, mainMenuKeyboard, parseCallbackData, planApprovalKeyboard } from './telegram/keyboard.js';
+import { agentApprovalKeyboard, parseCallbackData, planApprovalKeyboard } from './telegram/keyboard.js';
 import { routeUpdate, type Route } from './telegram/router.js';
 import { ProviderManager, type ProviderEvent } from './ai/registry.js';
 import { NoProviderAvailableError } from './ai/types.js';
+import { ConversationalAgent, type AgentResult } from './agent/agent.js';
+import { ChatMemory } from './agent/memory.js';
+import { ToolRegistry } from './agent/registry.js';
+import { classifyApprovalReply } from './agent/intent.js';
 import { AnalysisEngine } from './core/analyzer.js';
 import { ApprovalError, ApprovalService } from './core/approval.js';
 import { ExecutionEngine } from './core/executor.js';
@@ -20,12 +24,11 @@ import { isCommandAllowed, parseAllowlist } from './github/commands.js';
 import { JobRunner } from './jobs/dispatcher.js';
 import { assertOwner, identityFromUpdate, isOwner, ownerIds, UnauthorizedError, type Identity } from './security/auth.js';
 import { checkRateLimit } from './security/rateLimit.js';
-import { isExplicitApproval, isRejection, wrapUntrusted } from './security/promptGuard.js';
+import { wrapUntrusted } from './security/promptGuard.js';
 import { escHtml, splitTelegramMessage, toPersianDigits, truncate } from './util/text.js';
-import { hmacSignShort, randomToken, safeEqual } from './util/crypto.js';
 import { logger } from './util/log.js';
 import { redact } from './security/redact.js';
-import type { JobKind, JobRow, PlanContent, Project, RequestRow } from './types.js';
+import type { JobKind, JobRow, Project, RequestRow } from './types.js';
 import { Store as StoreType } from './db/store.js';
 
 export interface BotContext {
@@ -38,23 +41,16 @@ interface ConversationState {
   note?: string;
 }
 
-const MENU_TO_COMMAND: Record<string, string> = {
-  'پروژه‌های من': '/projects',
-  'درخواست جدید': '/new',
-  'ادامه قبلی': '/resume',
-  'انتخاب مدل': '/models',
-  'تنظیمات API': '/provider',
-  'اتصال GitHub': '/github',
-  'وضعیت وظایف': '/tasks',
-  'تاریخچه': '/history',
-  'گزارش تست‌ها': '/tests',
-  'تنظیمات امنیتی': '/security',
-  'راهنما': '/help',
-};
-
+/**
+ * Shortcuts that still map to a deterministic handler. They are deliberately
+ * hidden from Telegram's command menu: the conversational agent is the product,
+ * these are only conveniences for the owner.
+ */
 const COMMANDS = [
-  { command: 'start', description: 'شروع و نمایش منو' },
-  { command: 'help', description: 'راهنمای فرمان‌ها' },
+  { command: 'start', description: 'شروع گفتگو' },
+  { command: 'help', description: 'راهنما' },
+  { command: 'cancel', description: 'لغو کار جاری' },
+  { command: 'reset', description: 'پاک کردن حافظه گفتگو' },
   { command: 'projects', description: 'لیست پروژه‌ها' },
   { command: 'project', description: 'انتخاب/افزودن پروژه: /project owner/repo' },
   { command: 'new', description: 'درخواست توسعه جدید' },
@@ -70,7 +66,6 @@ const COMMANDS = [
   { command: 'tests', description: 'گزارش آخرین اجرای تست‌ها' },
   { command: 'history', description: 'تاریخچه درخواست‌ها' },
   { command: 'security', description: 'تنظیمات و وضعیت امنیتی' },
-  { command: 'cancel', description: 'لغو درخواست/وظیفه جاری' },
   { command: 'settings', description: 'تنظیمات غیرمحرمانه' },
 ];
 
@@ -81,6 +76,10 @@ export class Bot {
   readonly approvals: ApprovalService;
   readonly analysis: AnalysisEngine;
   readonly runner: JobRunner;
+  /** Conversational agent: the primary interface of the bot. */
+  readonly agent: ConversationalAgent;
+  readonly tools: ToolRegistry;
+  readonly memory: ChatMemory;
 
   private constructor(
     readonly env: Env,
@@ -92,6 +91,17 @@ export class Bot {
     this.approvals = new ApprovalService(store, env.APPROVAL_SECRET, 30);
     this.analysis = new AnalysisEngine(this.providers, store, { COMMAND_ALLOWLIST: env.COMMAND_ALLOWLIST });
     this.runner = new JobRunner(this);
+    this.tools = new ToolRegistry();
+    this.memory = new ChatMemory(store);
+    this.agent = new ConversationalAgent({
+      env,
+      store,
+      providers: this.providers,
+      tools: this.tools,
+      github: () => this.github(),
+      fetchImpl,
+      memory: this.memory,
+    });
   }
 
   static async create(env: Env, sql?: Sql, fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis)): Promise<Bot> {
@@ -218,12 +228,6 @@ export class Bot {
       return;
     }
 
-    if (route.kind === 'menu') {
-      const mapped = MENU_TO_COMMAND[route.label];
-      if (mapped) await this.runCommand(mapped, '', chatId, identity, context);
-      return;
-    }
-
     if (route.kind === 'command') {
       await this.runCommand(route.command, route.args, chatId, identity, context);
       return;
@@ -243,17 +247,49 @@ export class Bot {
     switch (command) {
       case 'start': {
         await this.store.setSetting(`chat:${identity.telegramUserId}`, String(chatId));
-        console.log("TRYING TO SEND REPLY...");
-        await this.telegram.sendMessage(
+        await this.reply(
           chatId,
-          'سلام 👋\nمن مهندس نرم‌افزار هوش مصنوعی شما هستم.\nدرخواستت را به فارسی ساده بنویس؛ من مخزن را تحلیل می‌کنم، طرح می‌دهم و بعد از تأیید خودت کد می‌نویسم، تست اجرا می‌کنم و Pull Request می‌سازم.\n\nهیچ تغییری بدون تأیید شما انجام نمی‌شود.',
-          { replyMarkup: mainMenuKeyboard() },
+          [
+            'سلام 👋',
+            'من مهندس نرم‌افزار هوش مصنوعی تو هستم و مثل یک چت معمولی با من حرف می‌زنی؛ لازم نیست دستور خاصی حفظ کنی.',
+            '',
+            'مثلاً بنویس:',
+            '• «یک مخزن جدید به اسم test-app بساز»',
+            '• «فایل README.md مخزن test-app را بخوان»',
+            '• «یک تابع جمع در src/app.ts بنویس و کامیت کن»',
+            '• «الان چه کارهایی می‌توانی انجام بدهی؟»',
+            '',
+            'قبل از هر کار توانایی‌هایم را بررسی می‌کنم: اگر ابزار و دسترسی داشته باشم انجام می‌دهم؛ اگر نداشته باشم صریح می‌گویم دسترسی ندارم.',
+            'کارهای حساس (ساخت مخزن، کامیت، Pull Request، اجرای تست) بدون «بله» تو انجام نمی‌شود.',
+            '',
+            'فقط دو دستور لازم داری: /cancel برای لغو و /reset برای پاک کردن حافظه گفتگو.',
+          ].join('\n'),
         );
         return;
       }
       case 'help': {
-        const list = COMMANDS.map((item) => `/${item.command} — ${item.description}`).join('\n');
-        await this.reply(chatId, `📖 <b>فرمان‌ها</b>\n\n${escHtml(list)}\n\nهمچنین می‌توانی جمله‌ات را ساده بنویسی، مثلاً:\n«یک بخش لاگ اضافه کن که خطاها را ذخیره کند»`);
+        const list = COMMANDS.filter((item) => !['start', 'help', 'cancel', 'reset'].includes(item.command))
+          .map((item) => `/${item.command} — ${item.description}`)
+          .join('\n');
+        await this.reply(
+          chatId,
+          [
+            '📖 <b>راهنما</b>',
+            '',
+            'هسته کار، گفتگوی آزاد است. کافی است خواسته‌ات را بنویسی:',
+            '«مخزن test-app را بساز»، «فایل src/app.ts را بخوان»، «این کد را کامیت کن»، «تست‌ها را اجرا کن».',
+            '',
+            'من اول ابزارهایم را بررسی می‌کنم، اگر دسترسی داشته باشم انجام می‌دهم و اگر نداشته باشم صریح می‌گویم.',
+            'کارهای حساس را قبل از انجام، با «بله/خیر» از تو می‌پرسم.',
+            '',
+            'دستورهای اصلی:',
+            '/cancel — لغو کار جاری یا درخواست تأیید',
+            '/reset — پاک کردن حافظه گفتگو',
+            '',
+            'میان‌برهای اختیاری (لازم نیست از آن‌ها استفاده کنی):',
+            escHtml(list),
+          ].join('\n'),
+        );
         return;
       }
       case 'projects': {
@@ -478,19 +514,29 @@ export class Bot {
         await this.reply(chatId, `🔐 <b>وضعیت امنیتی</b>\n\n${lines.map((line) => `• ${escHtml(line)}`).join('\n')}\n\nآخرین رویدادها:\n${auditLines.join('\n')}`);
         return;
       }
+      case 'reset': {
+        const removed = await this.memory.clear(identity.telegramUserId);
+        await this.store.supersedePendingActions(identity.telegramUserId);
+        await this.setConversation(identity.telegramUserId, { state: 'idle' });
+        await this.reply(chatId, `🧹 حافظه گفتگو پاک شد (${toPersianDigits(removed)} پیام). از این به بعد از صفر شروع می‌کنیم.`);
+        return;
+      }
       case 'cancel': {
         const conversation = await this.getConversation(identity.telegramUserId);
         await this.setConversation(identity.telegramUserId, { state: 'idle' });
+        const superseded = await this.store.supersedePendingActions(identity.telegramUserId);
+        const notes: string[] = [];
+        if (superseded > 0) notes.push('درخواست تأیید باز لغو شد و هیچ کاری انجام نشد.');
         const project = await this.activeProject();
         if (project) {
           const request = await this.store.latestRequestForProject(project.id);
           if (request && ['draft', 'queued', 'analyzing', 'awaiting_approval'].includes(request.status)) {
             await this.store.setRequestStatus(request.id, 'cancelled');
-            await this.reply(chatId, `🚫 درخواست <code>${escHtml(request.id)}</code> لغو شد.`);
-            return;
+            notes.push(`درخواست <code>${escHtml(request.id)}</code> لغو شد.`);
           }
         }
-        await this.reply(chatId, conversation?.state === 'idle' ? 'چیزی برای لغو نیست.' : '🚫 عملیات جاری لغو شد.');
+        await this.store.audit(actor, 'command.cancel', superseded ? String(superseded) : undefined);
+        await this.reply(chatId, notes.length ? `🚫 ${notes.join(' ')}` : conversation?.state === 'idle' ? 'چیزی برای لغو نیست.' : '🚫 عملیات جاری لغو شد.');
         return;
       }
       case 'settings': {
@@ -506,7 +552,9 @@ export class Bot {
         return;
       }
       default:
-        await this.reply(chatId, `فرمان ناشناس: /${escHtml(command)}\nبرای دیدن فرمان‌ها /help را بزن.`);
+        // Unknown slash-commands are not an error state any more: they are just
+        // another way the owner can phrase a request, so they reach the agent.
+        await this.handleFreeText(args ? `/${command} ${args}` : `/${command}`, chatId, identity, context);
     }
   }
 
@@ -523,6 +571,14 @@ export class Bot {
   }
 
   // -------------------------------------------------------------- free text
+  /**
+   * Every free-text message ends up here.
+   *
+   * Order matters:
+   *   1. an explicit "بله"/"خیر" answers the pending sensitive action,
+   *   2. the legacy plan flows (/new, /resume) still own their conversation slot,
+   *   3. everything else is a normal chat turn for the agent.
+   */
   private async handleFreeText(text: string, chatId: number, identity: Identity, context: BotContext): Promise<void> {
     const conversation = await this.getConversation(identity.telegramUserId);
 
@@ -538,32 +594,67 @@ export class Bot {
       return;
     }
 
-    if (isExplicitApproval(text)) {
-      const project = await this.activeProject();
-      const request = project ? await this.store.latestRequestForProject(project.id) : null;
-      if (request && request.status === 'awaiting_approval') {
-        await this.reply(chatId, 'برای اطمینان، دکمه «تأیید و شروع» زیر همان طرح را بزن (تأیید شفاهی کافی نیست).');
-        await this.sendPlanMessage(request, chatId);
+    const pending = await this.store.latestPendingAction(identity.telegramUserId);
+    if (pending) {
+      const intent = classifyApprovalReply(text);
+      if (intent === 'approve' || intent === 'reject') {
+        await this.runAgentDecision(pending.id, intent === 'approve', chatId, identity, context);
         return;
       }
     }
 
-    if (isRejection(text)) {
-      await this.runCommand('/cancel', '', chatId, identity, context);
+    await this.runAgentTurn(text, chatId, identity, context);
+  }
+
+  /** One conversational turn: model answer or an approval question. */
+  private async runAgentTurn(text: string, chatId: number, identity: Identity, context: BotContext): Promise<void> {
+    const work = (async () => {
+      await this.telegram.sendChatAction(chatId, 'typing').catch(() => false);
+      const result = await this.agent.respond({ userId: identity.telegramUserId, chatId, text });
+      await this.deliverAgentResult(result, chatId);
+      await this.store.audit(String(identity.telegramUserId), 'agent.turn', result.kind);
+    })().catch(async (error) => {
+      if (error instanceof NoProviderAvailableError) {
+        await this.reply(chatId, '⏸ الان هیچ ارائه‌دهنده هوش مصنوعی رایگانی در دسترس نیست. کمی بعد دوباره تلاش کن.');
+        return;
+      }
+      logger.error('agent.turn_failed', { error: (error as Error).message });
+      await this.reply(chatId, `❌ پردازش پیام ممکن نشد: ${escHtml(truncate((error as Error).message, 300))}`);
+    });
+    if (context.waitUntil) context.waitUntil(work);
+    else await work;
+  }
+
+  /** Owner approved or rejected a pending sensitive action. */
+  private async runAgentDecision(
+    actionId: string,
+    approved: boolean,
+    chatId: number,
+    identity: Identity,
+    context: BotContext,
+  ): Promise<void> {
+    const work = (async () => {
+      await this.telegram.sendChatAction(chatId, 'typing').catch(() => false);
+      const result = await this.agent.decide({ userId: identity.telegramUserId, chatId, actionId, approved });
+      await this.deliverAgentResult(result, chatId);
+    })().catch(async (error) => {
+      logger.error('agent.decision_failed', { error: (error as Error).message });
+      await this.reply(chatId, `❌ انجام این کار ممکن نشد: ${escHtml(truncate((error as Error).message, 300))}`);
+    });
+    if (context.waitUntil) context.waitUntil(work);
+    else await work;
+  }
+
+  /**
+   * Agent text is plain text (the model is told not to emit HTML), so it is
+   * escaped before it goes through Telegram's HTML parse mode.
+   */
+  private async deliverAgentResult(result: AgentResult, chatId: number): Promise<void> {
+    if (result.kind === 'approval') {
+      await this.reply(chatId, escHtml(result.text), agentApprovalKeyboard(result.actionId));
       return;
     }
-
-    const nonce = randomToken(12);
-    const token = await this.signAction('newreq', nonce);
-    await this.store.setSetting(
-      `pending:newreq:${identity.telegramUserId}`,
-      JSON.stringify({ text, nonce, expiresAt: Date.now() + 10 * 60_000 }),
-    );
-    await this.reply(
-      chatId,
-      `می‌خواهی این را به‌عنوان درخواست جدید ثبت کنم؟\n\n«${escHtml(truncate(text, 300))}»`,
-      confirmKeyboard('newreq', nonce, token),
-    );
+    await this.reply(chatId, escHtml(result.text));
   }
 
   private async handleDocument(fileName: string, fileSize: number, chatId: number, identity: Identity): Promise<void> {
@@ -588,6 +679,13 @@ export class Bot {
     const queryId = update.callback_query?.id;
     if (!parsed) {
       if (queryId) await this.telegram.answerCallbackQuery(queryId, 'دکمه نامعتبر است');
+      return;
+    }
+
+    if (parsed.scope === 'agent') {
+      const approved = parsed.action === 'approve';
+      if (queryId) await this.telegram.answerCallbackQuery(queryId, approved ? 'تأیید شد؛ شروع می‌کنم' : 'لغو شد');
+      await this.runAgentDecision(parsed.requestId, approved, chatId, identity, context);
       return;
     }
 
@@ -642,38 +740,6 @@ export class Bot {
         await this.reply(chatId, '🚫 درخواست لغو شد. هیچ تغییری در مخزن ایجاد نشد.');
         await this.store.audit(String(identity.telegramUserId), 'request.cancelled', parsed.requestId);
       }
-      if (queryId) await this.telegram.answerCallbackQuery(queryId);
-      return;
-    }
-
-    if (parsed.action === 'confirm' && parsed.scope === 'newreq') {
-      const key = `pending:newreq:${identity.telegramUserId}`;
-      const raw = await this.store.getSetting(key);
-      let pending: { text?: string; nonce?: string; expiresAt?: number } | null = null;
-      try {
-        pending = raw ? (JSON.parse(raw) as { text?: string; nonce?: string; expiresAt?: number }) : null;
-      } catch {
-        pending = null;
-      }
-      const expected = await this.signAction('newreq', parsed.requestId);
-      if (
-        !pending?.text ||
-        pending.nonce !== parsed.requestId ||
-        !pending.expiresAt ||
-        pending.expiresAt <= Date.now() ||
-        !(await safeEqual(expected, parsed.token))
-      ) {
-        await this.store.deleteSetting(key);
-        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'درخواست منقضی شده؛ دوباره بفرست', true);
-        return;
-      }
-      // DELETE ... RETURNING semantics via an atomic conditional consume make
-      // a double click unable to create two requests.
-      if (!(await this.store.consumeSetting(key))) {
-        if (queryId) await this.telegram.answerCallbackQuery(queryId, 'این درخواست قبلاً ثبت شد', true);
-        return;
-      }
-      await this.startRequest(pending.text, chatId, identity, context);
       if (queryId) await this.telegram.answerCallbackQuery(queryId);
       return;
     }
@@ -786,7 +852,14 @@ export class Bot {
   async runJob(jobId: string, kind: JobKind): Promise<void> {
     const job = await this.store.getJob(jobId);
     if (!job) throw new Error('job not found');
-    const payload = JSON.parse(job.payload_json) as { requestId?: string; chatId?: number; planVersion?: number; commands?: string[] };
+    const payload = JSON.parse(job.payload_json) as {
+      requestId?: string;
+      chatId?: number;
+      planVersion?: number;
+      commands?: string[];
+      projectId?: string;
+      branch?: string;
+    };
     const chatId = payload.chatId ?? this.ownerChatId();
 
     if (kind === 'analyze') {
@@ -842,7 +915,8 @@ export class Bot {
     }
 
     if (kind === 'tests') {
-      const project = await this.activeProject();
+      const requestedProjectId = (payload as { projectId?: string }).projectId;
+      const project = requestedProjectId ? await this.store.getProject(requestedProjectId) : await this.activeProject();
       if (!project) throw new Error('پروژه فعالی برای اجرای تست نیست');
       const dispatcher = await this.dispatcher();
       const branch = String((job.payload_json && JSON.parse(job.payload_json).branch) || project.default_branch);
@@ -984,10 +1058,6 @@ export class Bot {
 
   private async setConversation(userId: number, state: ConversationState): Promise<void> {
     await this.store.setSetting(`convo:${userId}`, JSON.stringify(state));
-  }
-
-  private async signAction(scope: string, nonce: string): Promise<string> {
-    return `${nonce}.${await hmacSignShort(this.env.APPROVAL_SECRET, `${scope}.${nonce}`)}`;
   }
 
   async tick(): Promise<{ processed: number; failed: number }> {

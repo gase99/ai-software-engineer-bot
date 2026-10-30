@@ -1,9 +1,14 @@
 # AI Software Engineer Bot — Zero-Cost Edition
 
-A Telegram bot that understands plain-Persian feature requests, analyzes a GitHub
-repository, produces a **Persian execution plan**, and — **only after an explicit,
-signed approval from the owner** — creates a branch, writes real code, runs tests in
-GitHub Actions and opens a Pull Request.
+A **conversational agent** on Telegram. You talk to it in plain Persian ("create a new
+repo", "read this file", "commit this code"); it decides which tool to call
+(**function calling**), **asks for confirmation in natural language** before anything
+sensitive happens ("shall I proceed?" → "yes/no"), and remembers the conversation in D1
+so the next message can build on the previous one. When it has no tool or no permission
+it says so plainly instead of pretending.
+
+The fixed menu and mandatory slash commands are gone: only `/start`, `/cancel` and
+`/reset` remain, and the old commands survive as optional shortcuts.
 
 Deployment mode chosen by the owner: **Mode A — Serverless**
 (Cloudflare Workers + D1 + Telegram webhook; code execution and tests run in GitHub
@@ -13,9 +18,10 @@ Actions). No paid service is a hard dependency.
 
 | Area | State | Evidence |
 |---|---|---|
-| Bot skeleton, Persian menu, 19 commands | ✅ | 86 automated tests (mocked Telegram) |
+| Conversational agent (free text, tool calling, D1 memory, chat approvals) | ✅ | automated tests (mocked Telegram/GitHub/model) |
+| Legacy slash commands kept as optional shortcuts (no menu) | ✅ | automated tests |
 | Owner auth + rate limiting | ✅ | tests: stranger, forged callback, burst |
-| SQLite-compatible schema (15 tables) on D1/SQLite | ✅ | persistence test across restart |
+| SQLite-compatible schema (17 tables) on D1/SQLite | ✅ | persistence test across restart |
 | Multi-provider AI manager (Gemini/Groq/OpenRouter/DeepSeek/OpenAI/Anthropic) | ✅ | tests with HTTP mock |
 | Daily/monthly free-tier caps + queueing | ✅ | tests |
 | GitHub auth (real RS256 App JWT + PAT fallback) | ✅ | tests |
@@ -46,11 +52,15 @@ Docs: [`docs/setup-telegram.md`](docs/setup-telegram.md) ·
 [`docs/setup-ai-free-tiers.md`](docs/setup-ai-free-tiers.md) ·
 [`docs/deploy-cloudflare.md`](docs/deploy-cloudflare.md) ·
 [`docs/architecture.md`](docs/architecture.md) ·
+[`docs/agent.md`](docs/agent.md) ·
 [`docs/security.md`](docs/security.md)
 
 ## Hard rules
 
-1. No repository change without a valid approval bound to `request_id` + `plan_version`, signed and expiring. "ok", "thanks" and "hello" are **not** approvals.
+1. No sensitive action without a valid approval. In the conversational path every sensitive
+   tool call is parked in `pending_actions` (30 min TTL) and only runs after an explicit
+   "بله"/approve button; "باشه", "thanks" and "hello" are **not** approvals. The legacy
+   planner path still uses a signed approval bound to `request_id` + `plan_version`.
 2. No automatic upgrade to a paid model. Order: Gemini → Groq → OpenRouter (`:free`) → DeepSeek. OpenAI/Anthropic only if you enable them.
 3. Keys never appear in code, GitHub, logs or Telegram messages.
 4. Model-produced commands never run directly — only the allow-list in `src/github/commands.ts` (mirrored in the workflow).
@@ -60,6 +70,6 @@ Docs: [`docs/setup-telegram.md`](docs/setup-telegram.md) ·
 ## Tests
 
 ```bash
-npm test          # 86 tests: unit, integration, end-to-end (mocked HTTP)
+npm test          # unit, integration, end-to-end (mocked HTTP)
 npm run typecheck
 ```

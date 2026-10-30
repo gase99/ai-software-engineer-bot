@@ -112,3 +112,29 @@ export interface ApprovalRow {
   decided_at: string | null;
   actor: string | null;
 }
+
+/** One persisted conversation message (chat memory). */
+export interface ChatMessageRow {
+  id: number;
+  telegram_user_id: string;
+  chat_id: string;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  message_json: string;
+  created_at: string;
+}
+
+export type PendingActionStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'superseded';
+
+/** Tool calls that are waiting for an explicit owner decision. */
+export interface PendingActionRow {
+  id: string;
+  telegram_user_id: string;
+  chat_id: string;
+  summary: string;
+  calls_json: string;
+  status: PendingActionStatus;
+  expires_at: string;
+  created_at: string;
+  decided_at: string | null;
+}

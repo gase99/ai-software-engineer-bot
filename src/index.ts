@@ -109,11 +109,12 @@ export default {
       const bot = await Bot.create(env);
       const path = webhookPath;
       await bot.telegram.setWebhook(`${body.url.replace(/\/$/, '')}${path}`, env.TELEGRAM_WEBHOOK_SECRET);
+      // The bot is a conversational agent: only the two lifecycle commands are
+      // advertised, everything else is natural language.
       await bot.telegram.setMyCommands([
-        { command: 'projects', description: 'پروژه‌های من' },
-        { command: 'new', description: 'درخواست جدید' },
-        { command: 'status', description: 'وضعیت' },
-        { command: 'models', description: 'انتخاب مدل' },
+        { command: 'start', description: 'شروع گفتگو' },
+        { command: 'cancel', description: 'لغو کار جاری' },
+        { command: 'reset', description: 'پاک کردن حافظه گفتگو' },
       ]);
       return json({ ok: true, webhook: `${body.url}${path}` });
     }
