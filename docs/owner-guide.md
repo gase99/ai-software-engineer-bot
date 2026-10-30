@@ -278,14 +278,14 @@ unset TELEGRAM_BOT_TOKEN TELEGRAM_WEBHOOK_SECRET
 خروجی مورد انتظار:
 
 - `ok:true`
-- `url` دقیقاً `[YOUR_WORKER_URL]/telegram/webhook`
+- `url` با مسیر ثبت‌شده مطابق `WEBHOOK_PATH` باشد؛ در تنظیم پیش‌فرض، `[YOUR_WORKER_URL]/webhook` نیز پذیرفته می‌شود.
 - `last_error_message` خالی یا وجود نداشته باشد
 - `pending_update_count` کم باشد و پیوسته زیاد نشود
 
 **چک این گام**
 
 - [ ] Webhook ثبت شده و Secret خالی نیست.
-- [ ] مسیر `/telegram/webhook` دقیق است.
+- [ ] مسیر با `WEBHOOK_PATH` یا با نام جایگزین `/webhook` در تنظیم پیش‌فرض مطابقت دارد.
 - [ ] هیچ Token در خروجی نمایش داده نشده است.
 
 ---

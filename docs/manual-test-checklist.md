@@ -28,7 +28,7 @@ Actions Run ناموفق: [YOUR_FAILURE_RUN_URL]
 ## ۱. Worker و Webhook
 
 - [ ] `GET [YOUR_WORKER_URL]/health` نتیجهٔ `"ok":true` می‌دهد.
-- [ ] `getWebhookInfo` نتیجهٔ `ok:true` و URL دقیق `[YOUR_WORKER_URL]/telegram/webhook` دارد.
+- [ ] `getWebhookInfo` نتیجهٔ `ok:true` و URL مطابق `WEBHOOK_PATH` دارد؛ در تنظیم پیش‌فرض، `/webhook` نیز پذیرفته می‌شود.
 - [ ] `last_error_message` خالی است و `pending_update_count` پیوسته رشد نمی‌کند.
 - [ ] درخواست Webhook بدون Secret یا با Secret اشتباه ۴۰۱ می‌گیرد. این تست را بدون افشای Secret واقعی انجام بده.
 - [ ] `npx wrangler tail` هیچ Secretی در لاگ نشان نمی‌دهد.

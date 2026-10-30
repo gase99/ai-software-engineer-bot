@@ -4,15 +4,36 @@
 
 | نشانه | علت احتمالی | بررسی |
 |---|---|---|
-| هیچ پیامی نمی‌آید | وب‌هوک ثبت نشده یا آدرس اشتباه است | `curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"` |
-| `last_error_message` پر است | Worker خطا می‌دهد یا مسیر اشتباه است | مسیر باید برابر `WEBHOOK_PATH` (پیش‌فرض `/telegram/webhook`) باشد |
-| خطای ۴۰۱ در لاگ Worker | سرّ وب‌هوک mismatch است | مقدار `x-telegram-bot-api-secret-token` باید برابر `TELEGRAM_WEBHOOK_SECRET` باشد |
-| `{"ok":false,"error":"not found"}` | مسیر یا متد اشتباه | فقط `POST` روی مسیر وب‌هوک و `GET /health` معتبر است |
+| هیچ پیامی نمی‌آید | وب‌هوک ثبت نشده یا آدرس اشتباه است | `getWebhookInfo` را طبق `docs/owner-guide.md` بررسی کن؛ Token را چاپ نکن |
+| `FETCH RESPONSE` با `status: 404` | مسیر یا متد با وب‌هوک تنظیم‌شده مطابقت ندارد | `FETCH ROUTE CHECK` و `WEBHOOK_PATH` را با URL ثبت‌شده تطبیق بده |
+| `FETCH RESPONSE` با `status: 401` یا `webhook.bad_secret` | Secret خالی یا متفاوت است | Secret ثبت‌شده در Telegram باید با `TELEGRAM_WEBHOOK_SECRET` یکی باشد؛ مقدار آن را در لاگ/چت نگذار |
+| `FETCH RESPONSE` با `status: 400` و `webhook.invalid_payload` | بدنهٔ درخواست برای وب‌هوک قابل‌استفاده نیست | درخواست‌دهنده و بدنه را بدون ثبت اطلاعات محرمانه بررسی کن |
+| `webhook.bot_init_failed` | ساخت Bot پیش از پاسخ با خطا مواجه شده است | خطای Worker، اتصال D1 و اجرای migration با `npm run db:migrate` را بررسی کن؛ این خطا به‌صورت پاسخ موفق تأیید نمی‌شود |
+| پاسخ ۲۰۰ ولی پیام ربات ارسال نمی‌شود | پردازش پس‌زمینه یا ارسال تلگرام خطا داشته است | `AUTH CHECK`, `webhook.handler_failed`, `update.failed` و `telegram.send_failed` را بررسی کن |
+
+تنظیم پیش‌فرض `WEBHOOK_PATH` برابر `/telegram/webhook` است؛ در این حالت
+`POST /webhook` نیز به همان هندلر و **همان بررسی اجباری Secret** می‌رسد.
+اگر `WEBHOOK_PATH` مقدار دیگری داشته باشد، فقط همان مسیر تنظیم‌شده معتبر است.
+در `FETCH ROUTE CHECK`، مقدار `isPost` متد و دو مقدار
+`matchesConfiguredWebhookPath` و `matchesDefaultWebhookAlias` تطابق مسیر را
+نشان می‌دهند؛ خود مسیر، Header و Secret در این لاگ چاپ نمی‌شوند.
+
+`{"ok":true}` در پاسخ `setWebhook` یعنی تلگرام ثبت را پذیرفته است، نه اینکه
+تحویل پیام موفق بوده است. همچنین `- Ok` در `wrangler tail` نتیجهٔ اجرای Worker
+است و به‌تنهایی کد HTTP پاسخ را ثابت نمی‌کند؛ `FETCH RESPONSE`، پاسخ واقعی با
+`curl -i` و `last_error_message` را بررسی کن. اگر واقعاً کد پاسخ با این لاگ‌ها
+نمی‌خواند، Worker، آدرس و نسخهٔ دیپلوی‌شده را نیز تطبیق بده.
 
 ```bash
 curl https://<worker>.workers.dev/health
+# بدون Secret واقعی: اگر /webhook در Worker فعلی معتبر باشد باید 401 برگردد.
+curl -i -X POST https://<worker>.workers.dev/webhook -H 'content-type: application/json' -d '{}'
 npx wrangler tail    # لاگ زنده
 ```
+
+پاسخ ۲۰۰ وب‌هوک یعنی پردازش در `waitUntil` زمان‌بندی شده، نه اینکه پاسخ تلگرام حتماً
+ارسال شده است. لاگ دیباگ موجود `INCOMING UPDATE` محتوای پیام را ثبت می‌کند؛
+دسترسی به لاگ‌ها را محدود کن و پس از عیب‌یابی این لاگ را بردار.
 
 ## «شما اجازه استفاده از این ربات را ندارید»
 
