@@ -44,6 +44,10 @@ export interface Env {
   AI_MONTHLY_TOKEN_LIMIT?: string;
   ACTIONS_MONTHLY_MINUTE_LIMIT?: string;
   COMMAND_ALLOWLIST?: string;
+  /** '1' (default) starts a request straight from plain chat; '0' asks first. */
+  AUTO_START_REQUESTS?: string;
+  /** How many recent chat turns are replayed to the model (default 8). */
+  CONVERSATION_HISTORY_TURNS?: string;
 }
 
 export function num(env: Env, key: keyof Env, fallback: number): number {
